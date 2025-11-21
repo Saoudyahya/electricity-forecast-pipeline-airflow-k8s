@@ -1,0 +1,110 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+pip-wheel-metadata/
+
+# Virtual environments
+.env
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# PyCharm / IDEs
+.idea/
+*.iml
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs, caches, test output
+logs/
+*.log
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Type checkers / linters
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Airflow
+airflow.cfg
+airflow.db
+.airflowignore
+
+# MLflow
+mlruns/
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.onnx
+saved_models/
+checkpoints/
+
+# Data files (ignore large/raw datasets)
+data/
+datasets/
+*.csv
+*.tsv
+*.parquet
+*.npz
+*.npy
+
+# Secrets / keys / credentials
+.env.*
+*.pem
+*.key
+secrets.json
+.credentials
+
+# Packaging / build artifacts
+*.egg
+*.whl
+*.zip
+*.tar.gz
+
+# Misc
+.idea/
+local_settings.py
+instance/
+*.sqlite3

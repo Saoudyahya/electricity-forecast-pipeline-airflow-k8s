@@ -1,0 +1,44 @@
+# config.yaml
+# Configuration for Electricity Load Forecasting Pipeline
+
+api:
+  eia_api_key: "YOUR_EIA_API_KEY_HERE"  # Get from: https://www.eia.gov/opendata/register.php
+  eia_base_url: "https://api.eia.gov/v2"
+  endpoint: "/electricity/rto/region-data/data/"
+  
+storage:
+  minio_endpoint: "minio.minio.svc.cluster.local:9000"
+  minio_access_key: "minioadmin"
+  minio_secret_key: "minioadmin"
+  bucket_name: "electricity-data"
+  raw_data_prefix: "raw/"
+  processed_data_prefix: "processed/"
+  predictions_prefix: "predictions/"
+
+mlflow:
+  tracking_uri: "http://mlflow.mlflow.svc.cluster.local:5000"
+  experiment_name: "electricity-load-forecasting"
+  
+kubeflow:
+  pipeline_host: "http://ml-pipeline.kubeflow.svc.cluster.local:8888"
+  namespace: "kubeflow"
+
+model:
+  sequence_length: 168  # 7 days of hourly data
+  prediction_horizon: 24  # Predict next 24 hours
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
+  learning_rate: 0.001
+  batch_size: 32
+  epochs: 50
+
+validation:
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+
+drift_detection:
+  reference_window_days: 30
+  current_window_days: 7
+  drift_threshold: 0.1
