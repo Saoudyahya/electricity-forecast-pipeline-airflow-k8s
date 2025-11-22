@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class EIADataExtractor:
     """Extract electricity load data from EIA API"""
     
-    def __init__(self, config_path: str = "config.yaml"):
+    def __init__(self, config_path: str = "../config.yaml"):
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
         
@@ -87,7 +87,7 @@ class EIADataExtractor:
             all_data.extend(records)
             
             # Check if there are more pages
-            total = data['response'].get('total', 0)
+            total = int(data['response'].get('total', 0))
             if params['offset'] + params['length'] >= total:
                 break
             
@@ -169,7 +169,7 @@ if __name__ == "__main__":
     extractor = EIADataExtractor()
     
     # Fetch data for California (CAL) region
-    df = extractor.fetch_recent_data(days=90, regions=['CAL'])
+    df = extractor.fetch_recent_data(days=90, regions=None)
     
     print(f"Data shape: {df.shape}")
     print(f"\nColumns: {df.columns.tolist()}")
@@ -177,4 +177,4 @@ if __name__ == "__main__":
     print(f"\nData statistics:\n{df['value'].describe()}")
     
     # Save locally
-    extractor.save_to_csv(df, "electricity_data.csv")
+    extractor.save_to_csv(df, "../data/electricity_data.csv")
