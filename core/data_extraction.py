@@ -10,18 +10,28 @@ from typing import Dict, List, Optional
 import logging
 import yaml
 from io import BytesIO
-
+from dotenv import load_dotenv
+import os
 logger = logging.getLogger(__name__)
 
 
 class EIADataExtractor:
     """Extract electricity load data from EIA API"""
-    
+
     def __init__(self, config_path: str = "../config.yaml"):
+        # Load environment variables from .env file
+        load_dotenv()
+
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
-        self.api_key = self.config['api']['eia_api_key']
+
+        # Get API key from environment variable or config
+        self.api_key = os.getenv('EIA_API_KEY') or self.config['api']['eia_api_key']
+
+        # Remove ${} placeholder if still present
+        if self.api_key.startswith('${') and self.api_key.endswith('}'):
+            raise ValueError("EIA_API_KEY environment variable not set")
+
         self.base_url = self.config['api']['eia_base_url']
         self.endpoint = self.config['api']['endpoint']
     
