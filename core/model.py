@@ -326,34 +326,85 @@ class ElectricityLoadForecaster:
             
             predictions = self.model(x_tensor)
             predictions = predictions.cpu().numpy()
-        
+
         # Inverse transform
         predictions_original = self.scaler.inverse_transform(
             predictions.reshape(-1, 1)
         ).flatten()
         
         return predictions_original
-    
+
     def save_model(self, filepath: str):
         """Save model checkpoint"""
+        import pickle
+
+        # Save model state and config
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scaler': self.scaler,
             'config': {
                 'model_type': self.model_type,
                 'sequence_length': self.sequence_length,
-                'prediction_horizon': self.prediction_horizon
+                'prediction_horizon': self.prediction_horizon,
+                'hidden_size': self.model.hidden_size if hasattr(self.model, 'hidden_size') else 128,
+                'num_layers': self.model.num_layers if hasattr(self.model, 'num_layers') else 2
             }
-        }, filepath)
+        }, filepath, _use_new_zipfile_serialization=True)
+
+        # Save scaler separately
+        scaler_path = filepath.replace('.pt', '_scaler.pkl')
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(self.scaler, f)
+
         logger.info(f"Model saved to {filepath}")
-    
+        logger.info(f"Scaler saved to {scaler_path}")
+
     def load_model(self, filepath: str):
         """Load model checkpoint"""
-        checkpoint = torch.load(filepath, map_location=self.device)
+        import pickle
+
+        # Load checkpoint with weights_only=True for security
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=True)
+
+        # Load config and reinitialize model with correct architecture
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            logger.info(f"Loading model with config: {config}")
+
+            # Reinitialize model with saved config
+            if config['model_type'] == "lstm":
+                self.model = LSTMForecaster(
+                    input_size=1,
+                    hidden_size=config.get('hidden_size', 128),
+                    num_layers=config.get('num_layers', 2),
+                    output_size=config['prediction_horizon'],
+                    dropout=0.2
+                ).to(self.device)
+            elif config['model_type'] == "transformer":
+                self.model = TransformerForecaster(
+                    input_size=1,
+                    d_model=config.get('hidden_size', 128),
+                    nhead=8,
+                    num_encoder_layers=config.get('num_layers', 2),
+                    output_size=config['prediction_horizon'],
+                    dropout=0.2
+                ).to(self.device)
+
+            # Update instance attributes
+            self.model_type = config['model_type']
+            self.sequence_length = config['sequence_length']
+            self.prediction_horizon = config['prediction_horizon']
+
+        # Load model weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer = torch.optim.Adam(self.model.parameters())
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scaler = checkpoint['scaler']
+
+        # Load scaler separately
+        scaler_path = filepath.replace('.pt', '_scaler.pkl')
+        with open(scaler_path, 'rb') as f:
+            self.scaler = pickle.load(f)
+
         logger.info(f"Model loaded from {filepath}")
 
 

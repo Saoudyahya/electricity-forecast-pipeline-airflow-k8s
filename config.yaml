@@ -2,7 +2,7 @@
 # Configuration for Electricity Load Forecasting Pipeline
 
 api:
-  eia_api_key: ""  # Get from: https://www.eia.gov/opendata/register.php
+  eia_api_key: "${EIA_API_KEY}"  # Get from: https://www.eia.gov/opendata/register.php
   eia_base_url: "https://api.eia.gov/v2"
   endpoint: "/electricity/rto/region-data/data/"
   
