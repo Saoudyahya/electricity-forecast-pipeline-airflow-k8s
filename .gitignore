@@ -91,7 +91,7 @@ datasets/
 *.npy
 
 # Secrets / keys / credentials
-.exampleenv
+
 *.pem
 *.key
 secrets.json
