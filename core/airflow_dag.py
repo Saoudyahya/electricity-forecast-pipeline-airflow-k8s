@@ -4,30 +4,69 @@ Airflow DAG for Electricity Load Forecasting Pipeline
 DAG Structure:
 1. Extract data from EIA API
 2. Validate data with Pandera
-3. Trigger Kubeflow training pipeline
-4. Daily batch inference
-5. Drift detection with EvidentlyAI
+3. Train model
+4. Batch inference
 """
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.operators.bash import BashOperator
-from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
+try:
+    from airflow.providers.standard.operators.python import PythonOperator
+except ImportError:
+    from airflow.operators.python import PythonOperator
+
 from datetime import datetime, timedelta
 import yaml
 import logging
-
-# Import custom modules
+import pandas as pd
+from io import BytesIO
 import sys
-sys.path.append('/opt/airflow/dags')
+import os
 
-from data_extraction import EIADataExtractor
-from data_validation import ElectricityDataValidator
+# Fix imports - when running from core/ directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+
+# Add both current and parent directory to path
+sys.path.insert(0, current_dir)
+sys.path.insert(0, parent_dir)
+
+# Import with fallback
+try:
+    from data_extraction import EIADataExtractor
+    from data_validation import ElectricityDataValidator
+    from model import ElectricityLoadForecaster
+except ImportError:
+    try:
+        from core.data_extraction import EIADataExtractor
+        from core.data_validation import ElectricityDataValidator
+        from core.model import ElectricityLoadForecaster
+    except ImportError:
+        sys.path.insert(0, '/opt/airflow/dags/core')
+        from data_extraction import EIADataExtractor
+        from data_validation import ElectricityDataValidator
+        from model import ElectricityLoadForecaster
 
 logger = logging.getLogger(__name__)
 
-# Load config
-with open('/opt/airflow/config/config.yaml', 'r') as f:
+# Load config - try multiple locations
+config_path = None
+possible_paths = [
+    '/opt/airflow/config/config.yaml',
+    'config.yaml',
+    '../config.yaml',
+    os.path.join(parent_dir, 'config.yaml'),
+    os.path.join(current_dir, '..', 'config.yaml')
+]
+
+for path in possible_paths:
+    if os.path.exists(path):
+        config_path = path
+        break
+
+if config_path is None:
+    raise FileNotFoundError("config.yaml not found in any expected location")
+
+with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
 # Default args
@@ -44,197 +83,250 @@ default_args = {
 def extract_data(**context):
     """Extract data from EIA API"""
     logger.info("Starting data extraction from EIA API")
-    
-    extractor = EIADataExtractor(config_path='/opt/airflow/config/config.yaml')
-    
-    # Fetch last 90 days of data
+
+    extractor = EIADataExtractor(config_path=config_path)
+
+    # Fetch last 90 days of data for all regions
     df = extractor.fetch_recent_data(
         days=90,
-        regions=['CAL', 'MIDA', 'TEX']  # California, Mid-Atlantic, Texas
+        regions=None  # Fetch all regions
     )
-    
-    # Save to MinIO
+
+    # Save locally first
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    object_name = f"{config['storage']['raw_data_prefix']}electricity_data_{timestamp}.csv"
-    
-    extractor.save_to_minio(df, object_name)
-    
+    local_path = f"/tmp/electricity_data_{timestamp}.csv"
+    extractor.save_to_csv(df, local_path)
+
+    # Try to save to MinIO if available
+    try:
+        object_name = f"{config['storage']['raw_data_prefix']}electricity_data_{timestamp}.csv"
+        extractor.save_to_minio(df, object_name)
+        logger.info(f"Data saved to MinIO: {object_name}")
+        data_path = object_name
+    except Exception as e:
+        logger.warning(f"MinIO not available, using local storage: {e}")
+        data_path = local_path
+
     # Push to XCom for next task
-    context['task_instance'].xcom_push(key='data_path', value=object_name)
+    context['task_instance'].xcom_push(key='data_path', value=data_path)
+    context['task_instance'].xcom_push(key='local_path', value=local_path)
     context['task_instance'].xcom_push(key='num_records', value=len(df))
-    
-    logger.info(f"Extracted {len(df)} records and saved to {object_name}")
-    
-    return object_name
+
+    logger.info(f"Extracted {len(df)} records")
+
+    return data_path
 
 
 def validate_data(**context):
     """Validate data using Pandera"""
     logger.info("Starting data validation")
-    
-    from minio import Minio
-    import pandas as pd
-    from io import BytesIO
-    
+
     # Get data path from previous task
     data_path = context['task_instance'].xcom_pull(
         task_ids='extract_data',
         key='data_path'
     )
-    
-    # Load data from MinIO
-    client = Minio(
-        config['storage']['minio_endpoint'],
-        access_key=config['storage']['minio_access_key'],
-        secret_key=config['storage']['minio_secret_key'],
-        secure=False
+    local_path = context['task_instance'].xcom_pull(
+        task_ids='extract_data',
+        key='local_path'
     )
-    
-    response = client.get_object(config['storage']['bucket_name'], data_path)
-    df = pd.read_csv(BytesIO(response.read()))
+
+    # Try to load from MinIO, fallback to local
+    try:
+        from minio import Minio
+
+        client = Minio(
+            config['storage']['minio_endpoint'],
+            access_key=config['storage']['minio_access_key'],
+            secret_key=config['storage']['minio_secret_key'],
+            secure=False
+        )
+
+        response = client.get_object(config['storage']['bucket_name'], data_path)
+        df = pd.read_csv(BytesIO(response.read()))
+        logger.info("Loaded data from MinIO")
+    except Exception as e:
+        logger.warning(f"Could not load from MinIO, using local file: {e}")
+        df = pd.read_csv(local_path)
+
     df['period'] = pd.to_datetime(df['period'])
-    
+
     # Validate
-    validator = ElectricityDataValidator(config_path='/opt/airflow/config/config.yaml')
+    validator = ElectricityDataValidator(config_path=config_path)
     validated_df, report = validator.validate(df)
-    
+
     if not report['is_valid']:
         raise ValueError(f"Data validation failed: {report['errors']}")
-    
+
     # Save validated data
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    validated_path = f"{config['storage']['processed_data_prefix']}validated_data_{timestamp}.csv"
-    
-    csv_bytes = validated_df.to_csv(index=False).encode('utf-8')
-    csv_buffer = BytesIO(csv_bytes)
-    
-    client.put_object(
-        config['storage']['bucket_name'],
-        validated_path,
-        csv_buffer,
-        length=len(csv_bytes),
-        content_type='text/csv'
-    )
-    
+    validated_local_path = f"/tmp/validated_data_{timestamp}.csv"
+    validated_df.to_csv(validated_local_path, index=False)
+
     # Save validation report
+    report_local_path = f"/tmp/validation_report_{timestamp}.json"
     import json
-    report_path = f"{config['storage']['processed_data_prefix']}validation_report_{timestamp}.json"
-    report_bytes = json.dumps(report, indent=2).encode('utf-8')
-    report_buffer = BytesIO(report_bytes)
-    
-    client.put_object(
-        config['storage']['bucket_name'],
-        report_path,
-        report_buffer,
-        length=len(report_bytes),
-        content_type='application/json'
-    )
-    
+    with open(report_local_path, 'w') as f:
+        json.dump(report, f, indent=2)
+
+    # Try to upload to MinIO if available
+    try:
+        from minio import Minio
+
+        client = Minio(
+            config['storage']['minio_endpoint'],
+            access_key=config['storage']['minio_access_key'],
+            secret_key=config['storage']['minio_secret_key'],
+            secure=False
+        )
+
+        # Upload validated data
+        validated_path = f"{config['storage']['processed_data_prefix']}validated_data_{timestamp}.csv"
+        csv_bytes = validated_df.to_csv(index=False).encode('utf-8')
+        csv_buffer = BytesIO(csv_bytes)
+
+        client.put_object(
+            config['storage']['bucket_name'],
+            validated_path,
+            csv_buffer,
+            length=len(csv_bytes),
+            content_type='text/csv'
+        )
+
+        # Upload report
+        report_path = f"{config['storage']['processed_data_prefix']}validation_report_{timestamp}.json"
+        report_bytes = json.dumps(report, indent=2).encode('utf-8')
+        report_buffer = BytesIO(report_bytes)
+
+        client.put_object(
+            config['storage']['bucket_name'],
+            report_path,
+            report_buffer,
+            length=len(report_bytes),
+            content_type='application/json'
+        )
+
+        logger.info("Uploaded validated data to MinIO")
+    except Exception as e:
+        logger.warning(f"MinIO upload failed, data saved locally: {e}")
+        validated_path = validated_local_path
+
     # Push to XCom
     context['task_instance'].xcom_push(key='validated_data_path', value=validated_path)
+    context['task_instance'].xcom_push(key='validated_local_path', value=validated_local_path)
     context['task_instance'].xcom_push(key='validation_report', value=report)
-    
-    logger.info(f"Data validation passed. Saved to {validated_path}")
-    
+
+    logger.info("Data validation passed")
+
     return validated_path
 
 
-def trigger_kubeflow_training(**context):
-    """Trigger Kubeflow training pipeline"""
-    logger.info("Triggering Kubeflow training pipeline")
-    
-    import kfp
-    from kfp import dsl
-    
+def train_model(**context):
+    """Train LSTM model"""
+    logger.info("Starting model training")
+
     # Get validated data path
-    data_path = context['task_instance'].xcom_pull(
+    validated_local_path = context['task_instance'].xcom_pull(
         task_ids='validate_data',
-        key='validated_data_path'
+        key='validated_local_path'
     )
-    
-    # Create Kubeflow client
-    client = kfp.Client(host=config['kubeflow']['pipeline_host'])
-    
-    # Submit pipeline run
-    run_name = f"electricity-forecast-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    
-    run = client.create_run_from_pipeline_func(
-        pipeline_func=training_pipeline,
-        arguments={
-            'data_path': data_path,
-            'model_type': 'lstm',
-            'sequence_length': config['model']['sequence_length'],
-            'prediction_horizon': config['model']['prediction_horizon'],
-            'hidden_size': config['model']['hidden_size'],
-            'num_layers': config['model']['num_layers'],
-            'epochs': config['model']['epochs']
-        },
-        run_name=run_name,
-        namespace=config['kubeflow']['namespace']
+
+    # Load data
+    df = pd.read_csv(validated_local_path)
+    df['period'] = pd.to_datetime(df['period'])
+
+    # Select one region for training
+    if 'respondent' in df.columns:
+        region_counts = df['respondent'].value_counts()
+        selected_region = region_counts.index[0]
+        df = df[df['respondent'] == selected_region].copy()
+        logger.info(f"Training on region: {selected_region}")
+
+    # Initialize forecaster
+    forecaster = ElectricityLoadForecaster(
+        model_type=config['model'].get('model_type', 'lstm'),
+        sequence_length=config['model']['sequence_length'],
+        prediction_horizon=config['model']['prediction_horizon'],
+        hidden_size=config['model']['hidden_size'],
+        num_layers=config['model']['num_layers'],
+        dropout=config['model'].get('dropout', 0.2),
+        learning_rate=config['model'].get('learning_rate', 0.001)
     )
-    
-    logger.info(f"Started Kubeflow run: {run_name}")
-    context['task_instance'].xcom_push(key='kfp_run_id', value=run.run_id)
-    
-    return run.run_id
+
+    # Prepare data
+    train_loader, val_loader, test_loader = forecaster.prepare_data(
+        df,
+        train_split=config['validation']['train_split'],
+        val_split=config['validation']['val_split']
+    )
+
+    # Train
+    forecaster.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=config['model']['epochs'],
+        early_stopping_patience=10
+    )
+
+    # Evaluate
+    test_rmse, test_mape = forecaster.evaluate(test_loader)
+    logger.info(f"Test RMSE: {test_rmse:.4f}, Test MAPE: {test_mape:.2f}%")
+
+    # Save model
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_path = f"/tmp/model_{timestamp}.pt"
+    forecaster.save_model(model_path)
+
+    # Push to XCom
+    context['task_instance'].xcom_push(key='model_path', value=model_path)
+    context['task_instance'].xcom_push(key='test_rmse', value=test_rmse)
+    context['task_instance'].xcom_push(key='test_mape', value=test_mape)
+
+    logger.info(f"Model training complete. Saved to {model_path}")
+
+    return model_path
 
 
 def batch_inference(**context):
     """Run batch inference on latest data"""
     logger.info("Starting batch inference")
-    
-    from minio import Minio
-    import pandas as pd
-    from io import BytesIO
-    import mlflow
-    from model import ElectricityLoadForecaster
-    
-    # Setup MLflow
-    mlflow.set_tracking_uri(config['mlflow']['tracking_uri'])
-    mlflow.set_experiment(config['mlflow']['experiment_name'])
-    
-    # Load latest model from MLflow
-    model_name = "electricity-load-forecaster"
-    model_version = "latest"
-    
-    try:
-        model_uri = f"models:/{model_name}/{model_version}"
-        # In production, load model from MLflow
-        # For now, we'll use local model
-        forecaster = ElectricityLoadForecaster()
-        forecaster.load_model("best_model.pt")
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        raise
-    
-    # Load recent data
-    client = Minio(
-        config['storage']['minio_endpoint'],
-        access_key=config['storage']['minio_access_key'],
-        secret_key=config['storage']['minio_secret_key'],
-        secure=False
-    )
-    
-    # Get latest validated data
-    data_path = context['task_instance'].xcom_pull(
+
+    # Get paths
+    validated_local_path = context['task_instance'].xcom_pull(
         task_ids='validate_data',
-        key='validated_data_path'
+        key='validated_local_path'
     )
-    
-    response = client.get_object(config['storage']['bucket_name'], data_path)
-    df = pd.read_csv(BytesIO(response.read()))
+    model_path = context['task_instance'].xcom_pull(
+        task_ids='train_model',
+        key='model_path'
+    )
+
+    # Load data
+    df = pd.read_csv(validated_local_path)
     df['period'] = pd.to_datetime(df['period'])
-    
-    # Prepare input sequence (last sequence_length hours)
+
+    # Select same region as training
+    if 'respondent' in df.columns:
+        region_counts = df['respondent'].value_counts()
+        selected_region = region_counts.index[0]
+        df = df[df['respondent'] == selected_region].copy()
+
+    # Load model
+    forecaster = ElectricityLoadForecaster(
+        model_type='lstm',
+        sequence_length=config['model']['sequence_length'],
+        prediction_horizon=config['model']['prediction_horizon']
+    )
+    forecaster.load_model(model_path)
+
+    # Prepare input sequence
     sequence_length = config['model']['sequence_length']
     input_sequence = df['value'].values[-sequence_length:].reshape(-1, 1)
-    
-    # Normalize
     input_scaled = forecaster.scaler.transform(input_sequence)
-    
+
     # Make predictions
     predictions = forecaster.predict(input_scaled)
-    
+
     # Create predictions dataframe
     last_timestamp = df['period'].iloc[-1]
     future_timestamps = pd.date_range(
@@ -242,122 +334,48 @@ def batch_inference(**context):
         periods=len(predictions),
         freq='H'
     )
-    
+
     predictions_df = pd.DataFrame({
         'timestamp': future_timestamps,
         'predicted_load': predictions
     })
-    
+
     # Save predictions
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    predictions_path = f"{config['storage']['predictions_prefix']}predictions_{timestamp}.csv"
-    
-    csv_bytes = predictions_df.to_csv(index=False).encode('utf-8')
-    csv_buffer = BytesIO(csv_bytes)
-    
-    client.put_object(
-        config['storage']['bucket_name'],
-        predictions_path,
-        csv_buffer,
-        length=len(csv_bytes),
-        content_type='text/csv'
-    )
-    
+    predictions_path = f"/tmp/predictions_{timestamp}.csv"
+    predictions_df.to_csv(predictions_path, index=False)
+
+    # Try to upload to MinIO if available
+    try:
+        from minio import Minio
+
+        client = Minio(
+            config['storage']['minio_endpoint'],
+            access_key=config['storage']['minio_access_key'],
+            secret_key=config['storage']['minio_secret_key'],
+            secure=False
+        )
+
+        minio_path = f"{config['storage']['predictions_prefix']}predictions_{timestamp}.csv"
+        csv_bytes = predictions_df.to_csv(index=False).encode('utf-8')
+        csv_buffer = BytesIO(csv_bytes)
+
+        client.put_object(
+            config['storage']['bucket_name'],
+            minio_path,
+            csv_buffer,
+            length=len(csv_bytes),
+            content_type='text/csv'
+        )
+
+        logger.info(f"Predictions uploaded to MinIO: {minio_path}")
+    except Exception as e:
+        logger.warning(f"MinIO upload failed: {e}")
+
     logger.info(f"Predictions saved to {predictions_path}")
     context['task_instance'].xcom_push(key='predictions_path', value=predictions_path)
-    
+
     return predictions_path
-
-
-def detect_drift(**context):
-    """Detect data drift using EvidentlyAI"""
-    logger.info("Starting drift detection")
-    
-    from evidently import ColumnMapping
-    from evidently.report import Report
-    from evidently.metric_preset import DataDriftPreset, DataQualityPreset
-    from minio import Minio
-    import pandas as pd
-    from io import BytesIO
-    
-    # Load historical (reference) data and current data
-    client = Minio(
-        config['storage']['minio_endpoint'],
-        access_key=config['storage']['minio_access_key'],
-        secret_key=config['storage']['minio_secret_key'],
-        secure=False
-    )
-    
-    # Get data paths
-    data_path = context['task_instance'].xcom_pull(
-        task_ids='validate_data',
-        key='validated_data_path'
-    )
-    
-    response = client.get_object(config['storage']['bucket_name'], data_path)
-    df = pd.read_csv(BytesIO(response.read()))
-    df['period'] = pd.to_datetime(df['period'])
-    
-    # Split into reference and current windows
-    reference_days = config['drift_detection']['reference_window_days']
-    current_days = config['drift_detection']['current_window_days']
-    
-    reference_data = df.iloc[:-current_days*24]  # Earlier data
-    current_data = df.iloc[-current_days*24:]    # Recent data
-    
-    # Create Evidently report
-    column_mapping = ColumnMapping(
-        numerical_features=['value'],
-        datetime_features=['period']
-    )
-    
-    report = Report(metrics=[
-        DataDriftPreset(),
-        DataQualityPreset()
-    ])
-    
-    report.run(
-        reference_data=reference_data,
-        current_data=current_data,
-        column_mapping=column_mapping
-    )
-    
-    # Save report
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"/tmp/drift_report_{timestamp}.html"
-    report.save_html(report_path)
-    
-    # Upload to MinIO
-    with open(report_path, 'rb') as f:
-        report_bytes = f.read()
-    
-    report_buffer = BytesIO(report_bytes)
-    minio_report_path = f"drift_reports/drift_report_{timestamp}.html"
-    
-    client.put_object(
-        config['storage']['bucket_name'],
-        minio_report_path,
-        report_buffer,
-        length=len(report_bytes),
-        content_type='text/html'
-    )
-    
-    logger.info(f"Drift report saved to {minio_report_path}")
-    
-    # Check for significant drift
-    report_dict = report.as_dict()
-    drift_detected = report_dict['metrics'][0]['result']['dataset_drift']
-    
-    if drift_detected:
-        logger.warning("⚠️ Data drift detected!")
-        # In production, trigger model retraining or send alerts
-    else:
-        logger.info("✓ No significant drift detected")
-    
-    context['task_instance'].xcom_push(key='drift_detected', value=drift_detected)
-    context['task_instance'].xcom_push(key='drift_report_path', value=minio_report_path)
-    
-    return drift_detected
 
 
 # Define the DAG
@@ -365,65 +383,53 @@ with DAG(
     'electricity_load_forecasting',
     default_args=default_args,
     description='End-to-end electricity load forecasting pipeline',
-    schedule_interval='0 */6 * * *',  # Run every 6 hours
+    schedule='0 */6 * * *',  # Updated from schedule_interval to schedule (Airflow 2.8+)
     start_date=datetime(2025, 1, 1),
     catchup=False,
     tags=['mlops', 'forecasting', 'electricity'],
 ) as dag:
-    
+
     # Task 1: Extract data from EIA API
     extract_task = PythonOperator(
         task_id='extract_data',
         python_callable=extract_data,
-        provide_context=True
     )
-    
+
     # Task 2: Validate data with Pandera
     validate_task = PythonOperator(
         task_id='validate_data',
         python_callable=validate_data,
-        provide_context=True
     )
-    
-    # Task 3: Trigger Kubeflow training pipeline
-    trigger_training_task = PythonOperator(
-        task_id='trigger_kubeflow_training',
-        python_callable=trigger_kubeflow_training,
-        provide_context=True
+
+    # Task 3: Train model
+    train_task = PythonOperator(
+        task_id='train_model',
+        python_callable=train_model,
     )
-    
-    # Task 4: Batch inference (runs daily)
+
+    # Task 4: Batch inference
     inference_task = PythonOperator(
         task_id='batch_inference',
         python_callable=batch_inference,
-        provide_context=True
     )
-    
-    # Task 5: Detect drift
-    drift_task = PythonOperator(
-        task_id='detect_drift',
-        python_callable=detect_drift,
-        provide_context=True
-    )
-    
+
     # Define task dependencies
-    extract_task >> validate_task >> trigger_training_task >> inference_task >> drift_task
+    extract_task >> validate_task >> train_task >> inference_task
 
 
-# Helper function for Kubeflow pipeline (referenced in trigger_kubeflow_training)
-@dsl.pipeline(
-    name='Electricity Load Forecasting Training',
-    description='Train LSTM model for electricity load forecasting'
-)
-def training_pipeline(
-    data_path: str,
-    model_type: str = 'lstm',
-    sequence_length: int = 168,
-    prediction_horizon: int = 24,
-    hidden_size: int = 128,
-    num_layers: int = 2,
-    epochs: int = 50
-):
-    """Kubeflow training pipeline definition"""
-    # This will be implemented in the kubeflow_pipeline.py file
-    pass
+if __name__ == "__main__":
+    print("=" * 60)
+    print("✓ DAG file loaded successfully!")
+    print("=" * 60)
+    print(f"Config path: {config_path}")
+    print(f"DAG ID: electricity_load_forecasting")
+    print(f"Schedule: Every 6 hours")
+    print(f"\nTasks:")
+    print("  1. extract_data")
+    print("  2. validate_data")
+    print("  3. train_model")
+    print("  4. batch_inference")
+    print("=" * 60)
+    print("\n⚠️  Note: This DAG is designed to run in Airflow.")
+    print("To use it, copy to your Airflow dags/ folder.")
+    print("=" * 60)
