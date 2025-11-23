@@ -21,7 +21,9 @@ import pandas as pd
 from io import BytesIO
 import sys
 import os
-import pandera
+import json
+import numpy as np
+
 # Fix imports - when running from core/ directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -78,6 +80,26 @@ default_args = {
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
 }
+
+
+def convert_numpy_types(obj):
+    """Convert numpy/pandas types to native Python types for JSON serialization"""
+    if isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif hasattr(obj, 'item'):  # For numpy scalars
+        return obj.item()
+    else:
+        return obj
 
 
 def extract_data(**context):
@@ -163,11 +185,11 @@ def validate_data(**context):
     validated_local_path = f"/tmp/validated_data_{timestamp}.csv"
     validated_df.to_csv(validated_local_path, index=False)
 
-    # Save validation report
+    # Save validation report - convert numpy types first
     report_local_path = f"/tmp/validation_report_{timestamp}.json"
-    import json
+    json_safe_report = convert_numpy_types(report)
     with open(report_local_path, 'w') as f:
-        json.dump(report, f, indent=2)
+        json.dump(json_safe_report, f, indent=2)
 
     # Try to upload to MinIO if available
     try:
@@ -193,9 +215,10 @@ def validate_data(**context):
             content_type='text/csv'
         )
 
-        # Upload report
+        # Upload report - convert numpy types first
         report_path = f"{config['storage']['processed_data_prefix']}validation_report_{timestamp}.json"
-        report_bytes = json.dumps(report, indent=2).encode('utf-8')
+        json_safe_report = convert_numpy_types(report)
+        report_bytes = json.dumps(json_safe_report, indent=2).encode('utf-8')
         report_buffer = BytesIO(report_bytes)
 
         client.put_object(
@@ -214,7 +237,7 @@ def validate_data(**context):
     # Push to XCom
     context['task_instance'].xcom_push(key='validated_data_path', value=validated_path)
     context['task_instance'].xcom_push(key='validated_local_path', value=validated_local_path)
-    context['task_instance'].xcom_push(key='validation_report', value=report)
+    context['task_instance'].xcom_push(key='validation_report', value=json_safe_report)
 
     logger.info("Data validation passed")
 
@@ -279,8 +302,8 @@ def train_model(**context):
 
     # Push to XCom
     context['task_instance'].xcom_push(key='model_path', value=model_path)
-    context['task_instance'].xcom_push(key='test_rmse', value=test_rmse)
-    context['task_instance'].xcom_push(key='test_mape', value=test_mape)
+    context['task_instance'].xcom_push(key='test_rmse', value=float(test_rmse))
+    context['task_instance'].xcom_push(key='test_mape', value=float(test_mape))
 
     logger.info(f"Model training complete. Saved to {model_path}")
 
