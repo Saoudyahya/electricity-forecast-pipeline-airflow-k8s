@@ -12,3 +12,20 @@ scikit-learn
 
 # Data Validation
 pandera
+
+
+# MLflow
+mlflow
+boto3
+
+kfp
+kubernetes
+
+
+evidently
+
+
+# Additional utilities
+tqdm
+matplotlib
+seaborn
