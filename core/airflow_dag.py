@@ -3,11 +3,12 @@ Fixed Airflow DAG for MLOps Pipeline
 Proper workflow:
 1. Airflow: Extract data from EIA API → save to MinIO raw/
 2. Airflow: Validate data with Pandera → save to MinIO processed/
-3. Airflow: Trigger Kubeflow Pipeline with validated data path
-4. Kubeflow: Train model, log to MLflow, save artifacts to MinIO
-5. Airflow: (Optional) Trigger Katib HPO
-6. Daily: Batch inference → save predictions to MinIO predictions/
-7. Daily: Drift detection with EvidentlyAI
+3. Airflow: Compile Kubeflow Pipeline YAML
+4. Airflow: Trigger Kubeflow Pipeline with validated data path
+5. Kubeflow: Train model, log to MLflow, save artifacts to MinIO
+6. Airflow: (Optional) Trigger Katib HPO
+7. Daily: Batch inference → save predictions to MinIO predictions/
+8. Daily: Drift detection with EvidentlyAI
 """
 
 from airflow import DAG
@@ -227,13 +228,108 @@ def validate_data(**context):
     return validated_path
 
 
+# ==================== COMPILE KUBEFLOW PIPELINE ====================
+def compile_kubeflow_pipeline(**context):
+    """Compile Kubeflow pipeline from Python to YAML"""
+    import subprocess
+    import shutil
+
+    logger.info("=" * 80)
+    logger.info("Compiling Kubeflow Pipeline")
+    logger.info("=" * 80)
+
+    # Paths
+    pipeline_script = '/opt/airflow/dags/repo/core/kubeflow_pipeline.py'
+    output_yaml = '/opt/airflow/dags/electricity_forecasting_pipeline.yaml'
+    temp_yaml = '/opt/airflow/dags/repo/core/electricity_forecasting_pipeline.yaml'
+
+    # Check if pipeline script exists
+    if not os.path.exists(pipeline_script):
+        logger.error(f"Pipeline script not found: {pipeline_script}")
+        raise FileNotFoundError(f"Pipeline script not found: {pipeline_script}")
+
+    logger.info(f"✓ Found pipeline script: {pipeline_script}")
+
+    try:
+        # Run the pipeline script to compile it
+        logger.info("Running pipeline compilation...")
+        result = subprocess.run(
+            [sys.executable, pipeline_script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd='/opt/airflow/dags/repo/core'
+        )
+
+        if result.returncode != 0:
+            logger.error("=" * 80)
+            logger.error("Pipeline compilation failed!")
+            logger.error("=" * 80)
+            logger.error(f"Return code: {result.returncode}")
+            logger.error(f"STDOUT:\n{result.stdout}")
+            logger.error(f"STDERR:\n{result.stderr}")
+            raise Exception(f"Pipeline compilation failed with return code {result.returncode}")
+
+        # Log compilation output
+        logger.info("Compilation output:")
+        for line in result.stdout.split('\n'):
+            if line.strip():
+                logger.info(f"  {line}")
+
+        # Check if YAML was created in the script directory
+        if os.path.exists(temp_yaml):
+            # Move/copy to DAGs folder
+            shutil.copy(temp_yaml, output_yaml)
+            logger.info(f"✓ Pipeline YAML copied from: {temp_yaml}")
+            logger.info(f"✓ Pipeline YAML available at: {output_yaml}")
+        elif os.path.exists(output_yaml):
+            logger.info(f"✓ Pipeline YAML already at: {output_yaml}")
+        else:
+            # List files to debug
+            logger.error("Pipeline YAML not found. Checking directories...")
+            logger.error(f"Files in {os.path.dirname(temp_yaml)}:")
+            for f in os.listdir(os.path.dirname(temp_yaml)):
+                logger.error(f"  - {f}")
+            raise FileNotFoundError("Pipeline YAML was not created by compilation")
+
+        # Verify the YAML file
+        file_size = os.path.getsize(output_yaml)
+        logger.info(f"✓ Pipeline YAML size: {file_size:,} bytes")
+
+        # Read and validate it's proper YAML
+        with open(output_yaml, 'r') as f:
+            pipeline_yaml = yaml.safe_load(f)
+
+        logger.info(f"✓ Pipeline YAML is valid")
+        logger.info(f"  Pipeline name: {pipeline_yaml.get('pipelineInfo', {}).get('name', 'unknown')}")
+
+        logger.info("=" * 80)
+        logger.info("✅ Pipeline compilation successful!")
+        logger.info("=" * 80)
+
+        # Push to XCom
+        context['task_instance'].xcom_push(key='pipeline_yaml_path', value=output_yaml)
+
+        return output_yaml
+
+    except subprocess.TimeoutExpired:
+        logger.error("=" * 80)
+        logger.error("❌ Pipeline compilation timed out (>120s)")
+        logger.error("=" * 80)
+        raise
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error(f"❌ Error during pipeline compilation")
+        logger.error("=" * 80)
+        logger.error(f"Error: {str(e)}")
+        logger.error(f"Error type: {type(e).__name__}")
+        raise
+
 
 # ==================== KUBEFLOW PIPELINE ====================
 def trigger_kubeflow_pipeline(**context):
     """Trigger Kubeflow Pipeline for model training with validated data from MinIO"""
     import kfp
-    import os
-    from kubernetes import client as k8s_client, config as k8s_config
 
     logger.info("Triggering Kubeflow Pipeline for model training")
 
@@ -247,8 +343,15 @@ def trigger_kubeflow_pipeline(**context):
         key='num_validated_records'
     )
 
+    # Get pipeline YAML path from compilation task
+    pipeline_yaml_path = context['task_instance'].xcom_pull(
+        task_ids='compile_pipeline',
+        key='pipeline_yaml_path'
+    )
+
     logger.info(f"Using validated data: {validated_data_path}")
     logger.info(f"Training on {num_records} validated records")
+    logger.info(f"Using pipeline: {pipeline_yaml_path}")
 
     # Kubeflow namespace (default user namespace)
     kf_namespace = 'kubeflow-user-example-com'
@@ -318,12 +421,11 @@ def trigger_kubeflow_pipeline(**context):
         logger.info(f"Namespace: {kf_namespace}")
 
         # Check if pipeline file exists
-        pipeline_file = '/opt/airflow/dags/electricity_forecasting_pipeline.yaml'
-        if not os.path.exists(pipeline_file):
-            logger.error(f"Pipeline file not found: {pipeline_file}")
-            raise FileNotFoundError(f"Pipeline YAML not found at {pipeline_file}")
+        if not os.path.exists(pipeline_yaml_path):
+            logger.error(f"Pipeline file not found: {pipeline_yaml_path}")
+            raise FileNotFoundError(f"Pipeline YAML not found at {pipeline_yaml_path}")
 
-        logger.info(f"Using pipeline file: {pipeline_file}")
+        logger.info(f"Using pipeline file: {pipeline_yaml_path}")
 
         # Create or get experiment
         try:
@@ -344,7 +446,7 @@ def trigger_kubeflow_pipeline(**context):
 
         # Submit the run
         run = kfp_client.create_run_from_pipeline_package(
-            pipeline_file=pipeline_file,
+            pipeline_file=pipeline_yaml_path,
             arguments=pipeline_params,
             run_name=run_name,
             experiment_name=config['mlflow']['experiment_name'] if experiment else None,
@@ -401,7 +503,7 @@ def trigger_kubeflow_pipeline(**context):
         elif "404" in str(e) or "Not Found" in str(e):
             logger.error("\n📁 PIPELINE FILE ERROR")
             logger.error("=" * 80)
-            logger.error(f"Pipeline file not found: {pipeline_file}")
+            logger.error(f"Pipeline file not found: {pipeline_yaml_path}")
             logger.error("Make sure the compiled pipeline YAML is in the DAGs folder")
             logger.error("=" * 80)
 
@@ -825,7 +927,7 @@ def detect_drift(**context):
 with DAG(
     'electricity_training_pipeline',
     default_args=default_args,
-    description='Weekly ML pipeline: Extract → Validate → Train with Kubeflow → Log to MLflow',
+    description='Weekly ML pipeline: Extract → Validate → Compile → Train with Kubeflow → Log to MLflow',
     schedule='0 0 * * 0',  # Every Sunday at midnight
     start_date=datetime(2025, 1, 1),
     catchup=False,
@@ -844,14 +946,20 @@ with DAG(
         python_callable=validate_data,
     )
 
-    # Task 3: Trigger Kubeflow Pipeline (trains model, logs to MLflow)
+    # Task 3: Compile Kubeflow Pipeline to YAML
+    compile_pipeline_task = PythonOperator(
+        task_id='compile_pipeline',
+        python_callable=compile_kubeflow_pipeline,
+    )
+
+    # Task 4: Trigger Kubeflow Pipeline (trains model, logs to MLflow)
     trigger_kfp = PythonOperator(
         task_id='trigger_kubeflow_pipeline',
         python_callable=trigger_kubeflow_pipeline,
     )
 
     # Define task dependencies
-    extract_task >> validate_task >> trigger_kfp
+    extract_task >> validate_task >> compile_pipeline_task >> trigger_kfp
 
 
 # DAG 2: Daily Inference and Monitoring
@@ -900,7 +1008,8 @@ if __name__ == "__main__":
     print("Tasks:")
     print("  1. extract_data           - Fetch from EIA API → MinIO raw/")
     print("  2. validate_data          - Validate with Pandera → MinIO processed/")
-    print("  3. trigger_kubeflow       - Train model → Log to MLflow")
+    print("  3. compile_pipeline       - Compile Kubeflow Pipeline Python → YAML")
+    print("  4. trigger_kubeflow       - Train model → Log to MLflow")
     print("\n🔮 DAG 2: electricity_daily_inference (Daily)")
     print("-" * 80)
     print("Schedule: Every day at 2 AM")
