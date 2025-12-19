@@ -241,7 +241,7 @@ def compile_kubeflow_pipeline(**context):
     # Paths
     pipeline_script = '/opt/airflow/dags/repo/core/kubeflow_pipeline.py'
     output_yaml = '/opt/airflow/dags/electricity_forecasting_pipeline.yaml'
-    temp_yaml = '/opt/airflow/dags/repo/core/electricity_forecasting_pipeline.yaml'
+    temp_yaml = '/tmp/electricity_forecasting_pipeline.yaml'  # Changed from read-only location
 
     # Check if pipeline script exists
     if not os.path.exists(pipeline_script):
@@ -258,7 +258,7 @@ def compile_kubeflow_pipeline(**context):
             capture_output=True,
             text=True,
             timeout=120,
-            cwd='/opt/airflow/dags/repo/core'
+            cwd='/tmp'  # Run from /tmp/ (writable directory)
         )
 
         if result.returncode != 0:
@@ -276,20 +276,22 @@ def compile_kubeflow_pipeline(**context):
             if line.strip():
                 logger.info(f"  {line}")
 
-        # Check if YAML was created in the script directory
+        # Check if YAML was created
         if os.path.exists(temp_yaml):
-            # Move/copy to DAGs folder
-            shutil.copy(temp_yaml, output_yaml)
-            logger.info(f"✓ Pipeline YAML copied from: {temp_yaml}")
-            logger.info(f"✓ Pipeline YAML available at: {output_yaml}")
-        elif os.path.exists(output_yaml):
-            logger.info(f"✓ Pipeline YAML already at: {output_yaml}")
+            logger.info(f"✓ Pipeline YAML created at: {temp_yaml}")
+            # File is already at /opt/airflow/dags/ if the script copied it
+            if os.path.exists(output_yaml):
+                logger.info(f"✓ Pipeline YAML available at: {output_yaml}")
+            else:
+                # Copy from /tmp/ to /opt/airflow/dags/
+                shutil.copy(temp_yaml, output_yaml)
+                logger.info(f"✓ Pipeline YAML copied to: {output_yaml}")
         else:
-            # List files to debug
             logger.error("Pipeline YAML not found. Checking directories...")
-            logger.error(f"Files in {os.path.dirname(temp_yaml)}:")
-            for f in os.listdir(os.path.dirname(temp_yaml)):
-                logger.error(f"  - {f}")
+            logger.error(f"Files in /tmp/:")
+            for f in os.listdir('/tmp'):
+                if 'pipeline' in f.lower() or 'yaml' in f.lower():
+                    logger.error(f"  - {f}")
             raise FileNotFoundError("Pipeline YAML was not created by compilation")
 
         # Verify the YAML file
@@ -998,33 +1000,49 @@ with DAG(
 # ===================================================================
 # MAIN
 # ===================================================================
-if __name__ == "__main__":
+if __name__ == '__main__':
+    import os
+
+    # Write to /tmp/ first (writable), then copy to /opt/airflow/dags/
+    output_path = '/tmp/electricity_forecasting_pipeline.yaml'
+
+    # Compile pipeline
+    compiler.Compiler().compile(
+        pipeline_func=electricity_training_pipeline,
+        package_path=output_path  # Write to /tmp/
+    )
+
     print("=" * 80)
-    print("✓ MLOps Pipeline DAGs Loaded Successfully!")
+    print("✅ Kubeflow Pipeline Compiled Successfully!")
     print("=" * 80)
-    print("\n📊 DAG 1: electricity_training_pipeline (Weekly)")
-    print("-" * 80)
-    print("Schedule: Every Sunday at midnight")
-    print("Tasks:")
-    print("  1. extract_data           - Fetch from EIA API → MinIO raw/")
-    print("  2. validate_data          - Validate with Pandera → MinIO processed/")
-    print("  3. compile_pipeline       - Compile Kubeflow Pipeline Python → YAML")
-    print("  4. trigger_kubeflow       - Train model → Log to MLflow")
-    print("\n🔮 DAG 2: electricity_daily_inference (Daily)")
-    print("-" * 80)
-    print("Schedule: Every day at 2 AM")
-    print("Tasks:")
-    print("  1. get_latest_model       - Fetch from MLflow Model Registry")
-    print("  2. batch_inference        - Predict → MinIO predictions/")
-    print("  3. detect_drift           - Monitor with EvidentlyAI")
-    print("\n💾 Data Storage (MinIO):")
-    print("  • raw/                    - Raw data from EIA API")
-    print("  • processed/              - Validated data ready for training")
-    print("  • predictions/            - Model predictions")
-    print("  • drift_reports/          - Drift detection reports")
-    print("  • validation_reports/     - Data validation reports")
-    print("\n📈 Model Registry (MLflow):")
-    print("  • Experiment tracking     - All training runs logged")
-    print("  • Model versioning        - Automatic version management")
-    print("  • Model artifacts         - Stored in MinIO via MLflow")
+    print(f"📄 Output: {output_path}")
+
+    # Copy to DAGs folder (writable location)
+    import shutil
+
+    final_path = '/opt/airflow/dags/electricity_forecasting_pipeline.yaml'
+    try:
+        shutil.copy(output_path, final_path)
+        print(f"✓ Copied to: {final_path}")
+    except Exception as e:
+        print(f"⚠️ Could not copy to {final_path}: {e}")
+        print(f"   Pipeline available at: {output_path}")
+
+    print("\n🔧 Pipeline Architecture:")
+    print("  Input:  Pre-validated data from MinIO (provided by Airflow)")
+    print("  Task:   Train LSTM/Transformer model")
+    print("  Output: Model logged to MLflow + artifacts in MinIO")
+    print("\n📊 Integration Flow:")
+    print("  1. Airflow extracts data from EIA → MinIO raw/")
+    print("  2. Airflow validates data → MinIO processed/")
+    print("  3. Airflow triggers THIS Kubeflow pipeline")
+    print("  4. Kubeflow trains model → MLflow + MinIO")
+    print("  5. Model ready for inference!")
+    print("\n💾 Storage:")
+    print("  • Training data:  MinIO (processed/)")
+    print("  • Model artifacts: MinIO (via MLflow)")
+    print("  • Experiments:     MLflow tracking server")
+    print("  • Model registry:  MLflow Model Registry")
     print("=" * 80)
+
+
