@@ -35,6 +35,24 @@ sys.path.insert(0, parent_dir)
 
 logger = logging.getLogger(__name__)
 
+
+# ==================== JSON ENCODER FOR NUMPY TYPES ====================
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles NumPy and Pandas types"""
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif pd.isna(obj):
+            return None
+        return super().default(obj)
+
+
 # Load config
 config_path = None
 possible_paths = [
@@ -101,7 +119,7 @@ def extract_data(**context):
 
     # Push data info to XCom
     context['task_instance'].xcom_push(key='raw_data_path', value=object_name)
-    context['task_instance'].xcom_push(key='num_records', value=len(df))
+    context['task_instance'].xcom_push(key='num_records', value=int(len(df)))
     context['task_instance'].xcom_push(key='timestamp', value=timestamp)
 
     logger.info(f"✓ Data saved to MinIO: s3://{config['storage']['bucket_name']}/{object_name}")
@@ -167,9 +185,9 @@ def validate_data(**context):
         for warning in report['warnings']:
             logger.warning(f"  ⚠️ {warning}")
 
-    # Save validation report to MinIO
+    # Save validation report to MinIO (with proper JSON encoding)
     report_path = f"validation_reports/validation_report_{timestamp}.json"
-    report_bytes = json.dumps(report, indent=2).encode('utf-8')
+    report_bytes = json.dumps(report, indent=2, cls=NumpyEncoder).encode('utf-8')
     report_buffer = BytesIO(report_bytes)
 
     client.put_object(
@@ -204,7 +222,7 @@ def validate_data(**context):
     # Push validated data path to XCom
     context['task_instance'].xcom_push(key='validated_data_path', value=validated_path)
     context['task_instance'].xcom_push(key='validation_report_path', value=report_path)
-    context['task_instance'].xcom_push(key='num_validated_records', value=len(validated_df))
+    context['task_instance'].xcom_push(key='num_validated_records', value=int(len(validated_df)))
 
     return validated_path
 
@@ -239,9 +257,8 @@ def trigger_kubeflow_pipeline(**context):
         raise
 
     # Pipeline parameters - pass the MinIO path of validated data
-    # Kubeflow will use this data directly instead of re-extracting
     pipeline_params = {
-        'input_object_name': validated_data_path,  # Pre-validated data from MinIO
+        'input_object_name': validated_data_path,
         'minio_endpoint': config['storage']['minio_endpoint'],
         'minio_access_key': config['storage']['minio_access_key'],
         'minio_secret_key': config['storage']['minio_secret_key'],
@@ -275,11 +292,6 @@ def trigger_kubeflow_pipeline(**context):
         logger.info(f"  Run ID: {run.run_id}")
         logger.info(f"  Run Name: {run_name}")
         logger.info(f"  Data Source: {validated_data_path}")
-
-        # Optional: Wait for completion (uncomment for synchronous execution)
-        # logger.info("Waiting for pipeline completion (this may take 10-30 minutes)...")
-        # run_detail = client.wait_for_run_completion(run.run_id, timeout=3600)
-        # logger.info(f"✓ Pipeline completed with status: {run_detail.run.status}")
 
         # Push run info to XCom
         context['task_instance'].xcom_push(key='pipeline_run_id', value=run.run_id)
@@ -390,7 +402,7 @@ def get_latest_model_from_mlflow(**context):
         logger.info(f"✓ Model URI: {model_uri}")
 
         # Push to XCom
-        context['task_instance'].xcom_push(key='model_version', value=latest_version.version)
+        context['task_instance'].xcom_push(key='model_version', value=str(latest_version.version))
         context['task_instance'].xcom_push(key='model_uri', value=model_uri)
         context['task_instance'].xcom_push(key='model_stage', value=latest_version.current_stage)
 
@@ -532,9 +544,9 @@ def batch_inference(**context):
     logger.info(f"  Predicted {len(predictions_df)} hours ahead")
     logger.info(f"  Mean predicted load: {predictions_scaled.mean():.2f} MW")
 
-    # Push to XCom
+    # Push to XCom (convert to Python types)
     context['task_instance'].xcom_push(key='predictions_path', value=predictions_path)
-    context['task_instance'].xcom_push(key='num_predictions', value=len(predictions_df))
+    context['task_instance'].xcom_push(key='num_predictions', value=int(len(predictions_df)))
     context['task_instance'].xcom_push(key='mean_prediction', value=float(predictions_scaled.mean()))
 
     return predictions_path
@@ -643,25 +655,25 @@ def detect_drift(**context):
         )
     logger.info(f"✓ Drift report saved to MinIO")
 
-    # Save drift metrics JSON
+    # Save drift metrics JSON (with proper encoding)
     drift_metrics = {
         'timestamp': timestamp,
-        'drift_detected': drift_detected,
+        'drift_detected': bool(drift_detected),
         'drift_share': float(drift_share),
-        'threshold': config['drift_detection']['drift_threshold'],
+        'threshold': float(config['drift_detection']['drift_threshold']),
         'reference_data': {
             'source': reference_object.object_name,
-            'size': len(reference_df),
+            'size': int(len(reference_df)),
             'date_range': f"{reference_df['period'].min()} to {reference_df['period'].max()}"
         },
         'current_data': {
             'source': current_object.object_name,
-            'size': len(current_df),
+            'size': int(len(current_df)),
             'date_range': f"{current_df['period'].min()} to {current_df['period'].max()}"
         }
     }
 
-    metrics_bytes = json.dumps(drift_metrics, indent=2).encode('utf-8')
+    metrics_bytes = json.dumps(drift_metrics, indent=2, cls=NumpyEncoder).encode('utf-8')
     metrics_buffer = BytesIO(metrics_bytes)
 
     client.put_object(
@@ -678,8 +690,8 @@ def detect_drift(**context):
     logger.info(f"  Threshold: {config['drift_detection']['drift_threshold']:.2%}")
 
     # Push to XCom
-    context['task_instance'].xcom_push(key='drift_detected', value=drift_detected)
-    context['task_instance'].xcom_push(key='drift_share', value=drift_share)
+    context['task_instance'].xcom_push(key='drift_detected', value=bool(drift_detected))
+    context['task_instance'].xcom_push(key='drift_share', value=float(drift_share))
 
     # Alert if drift detected
     if drift_detected or drift_share > config['drift_detection']['drift_threshold']:
@@ -689,7 +701,6 @@ def detect_drift(**context):
         logger.warning(f"   Threshold: {config['drift_detection']['drift_threshold']:.2%}")
         logger.warning("   Consider retraining the model")
         logger.warning("=" * 60)
-        # In production: send alert via email/Slack/PagerDuty
 
     return drift_metrics
 
@@ -727,16 +738,8 @@ with DAG(
         python_callable=trigger_kubeflow_pipeline,
     )
 
-    # Task 4: (Optional) Trigger Katib HPO - runs monthly
-    # Uncomment to enable HPO
-    # trigger_hpo = PythonOperator(
-    #     task_id='trigger_katib_hpo',
-    #     python_callable=trigger_katib_hpo,
-    # )
-
     # Define task dependencies
     extract_task >> validate_task >> trigger_kfp
-    # If HPO enabled: extract_task >> validate_task >> trigger_kfp >> trigger_hpo
 
 
 # DAG 2: Daily Inference and Monitoring
@@ -786,7 +789,6 @@ if __name__ == "__main__":
     print("  1. extract_data           - Fetch from EIA API → MinIO raw/")
     print("  2. validate_data          - Validate with Pandera → MinIO processed/")
     print("  3. trigger_kubeflow       - Train model → Log to MLflow")
-    print("  4. trigger_katib_hpo      - [Optional] Hyperparameter optimization")
     print("\n🔮 DAG 2: electricity_daily_inference (Daily)")
     print("-" * 80)
     print("Schedule: Every day at 2 AM")
