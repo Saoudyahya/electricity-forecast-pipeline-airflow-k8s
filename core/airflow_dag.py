@@ -348,26 +348,8 @@ def trigger_kubeflow_pipeline(**context):
     # Kubeflow namespace (default user namespace)
     kf_namespace = 'kubeflow-user-example-com'
 
-    # Connect to Kubeflow Pipelines with authentication
+    # Connect to Kubeflow Pipelines without authentication
     try:
-        # Method 1: Try using service account token
-        token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
-
-        # From this:
-        if os.path.exists(token_path):
-            logger.info("Using Kubernetes service account token for authentication")
-            with open(token_path, 'r') as f:
-                token = f.read().strip()
-
-            # Create KFP client with token
-            kfp_client = kfp.Client(
-                host=config['kubeflow']['pipeline_host'],
-                existing_token=token,
-                namespace=kf_namespace
-            )
-            logger.info("✓ Connected to Kubeflow with service account token")
-
-        # To this (skip token, connect without auth):
         logger.info("Connecting to Kubeflow without authentication")
         kfp_client = kfp.Client(
             host=config['kubeflow']['pipeline_host'],
@@ -375,21 +357,12 @@ def trigger_kubeflow_pipeline(**context):
         )
         logger.info("✓ Connected to Kubeflow without authentication")
 
-        else:
-            # Method 2: Try without authentication (if auth is disabled)
-            logger.warning("No service account token found, trying without authentication")
-            kfp_client = kfp.Client(
-                host=config['kubeflow']['pipeline_host'],
-                namespace=kf_namespace
-            )
-            logger.info("✓ Connected to Kubeflow without authentication")
-
     except Exception as e:
         logger.error(f"Failed to connect to Kubeflow: {e}")
         logger.error("Possible solutions:")
-        logger.error("1. Disable authentication in Kubeflow (for testing)")
-        logger.error("2. Create proper ServiceAccount with RBAC permissions")
-        logger.error("3. Use port-forward and localhost connection")
+        logger.error("1. Check if Kubeflow Pipelines is running")
+        logger.error("2. Verify pipeline_host in config.yaml")
+        logger.error("3. Try port-forward: kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888")
         raise
 
     # Pipeline parameters - pass the MinIO path of validated data
@@ -429,6 +402,7 @@ def trigger_kubeflow_pipeline(**context):
         logger.info(f"Using pipeline file: {pipeline_yaml_path}")
 
         # Create or get experiment
+        experiment = None
         try:
             experiment = kfp_client.get_experiment(experiment_name=config['mlflow']['experiment_name'])
             logger.info(f"✓ Using existing experiment: {experiment.experiment_id}")
