@@ -319,7 +319,6 @@ def compile_kubeflow_pipeline(**context):
 
 
 # ==================== KUBEFLOW PIPELINE ====================
-# ==================== KUBEFLOW PIPELINE ====================
 def trigger_kubeflow_pipeline(**context):
     """Trigger Kubeflow Pipeline for model training with validated data from MinIO"""
     import kfp
@@ -403,6 +402,7 @@ def trigger_kubeflow_pipeline(**context):
         logger.info(f"Using pipeline file: {pipeline_yaml_path}")
 
         # Create or get experiment
+        experiment = None
         try:
             experiment = kfp_client.get_experiment(experiment_name=config['mlflow']['experiment_name'])
             logger.info(f"✓ Using existing experiment: {experiment.experiment_id}")
