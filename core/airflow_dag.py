@@ -232,7 +232,6 @@ def validate_data(**context):
 def compile_kubeflow_pipeline(**context):
     """Compile Kubeflow pipeline from Python to YAML"""
     import subprocess
-    import shutil
 
     logger.info("=" * 80)
     logger.info("Compiling Kubeflow Pipeline")
@@ -240,8 +239,7 @@ def compile_kubeflow_pipeline(**context):
 
     # Paths
     pipeline_script = '/opt/airflow/dags/repo/core/kubeflow_pipeline.py'
-    output_yaml = '/opt/airflow/dags/electricity_forecasting_pipeline.yaml'
-    temp_yaml = '/tmp/electricity_forecasting_pipeline.yaml'  # Changed from read-only location
+    output_yaml = '/tmp/electricity_forecasting_pipeline.yaml'  # Keep in /tmp/ (writable)
 
     # Check if pipeline script exists
     if not os.path.exists(pipeline_script):
@@ -276,23 +274,15 @@ def compile_kubeflow_pipeline(**context):
             if line.strip():
                 logger.info(f"  {line}")
 
-        # Check if YAML was created
-        if os.path.exists(temp_yaml):
-            logger.info(f"✓ Pipeline YAML created at: {temp_yaml}")
-            # File is already at /opt/airflow/dags/ if the script copied it
-            if os.path.exists(output_yaml):
-                logger.info(f"✓ Pipeline YAML available at: {output_yaml}")
-            else:
-                # Copy from /tmp/ to /opt/airflow/dags/
-                shutil.copy(temp_yaml, output_yaml)
-                logger.info(f"✓ Pipeline YAML copied to: {output_yaml}")
-        else:
-            logger.error("Pipeline YAML not found. Checking directories...")
-            logger.error(f"Files in /tmp/:")
+        # Check if YAML was created in /tmp/
+        if not os.path.exists(output_yaml):
+            logger.error("Pipeline YAML not found. Checking /tmp/:")
             for f in os.listdir('/tmp'):
                 if 'pipeline' in f.lower() or 'yaml' in f.lower():
                     logger.error(f"  - {f}")
             raise FileNotFoundError("Pipeline YAML was not created by compilation")
+
+        logger.info(f"✓ Pipeline YAML created at: {output_yaml}")
 
         # Verify the YAML file
         file_size = os.path.getsize(output_yaml)
@@ -309,7 +299,7 @@ def compile_kubeflow_pipeline(**context):
         logger.info("✅ Pipeline compilation successful!")
         logger.info("=" * 80)
 
-        # Push to XCom
+        # Push to XCom - use /tmp/ path
         context['task_instance'].xcom_push(key='pipeline_yaml_path', value=output_yaml)
 
         return output_yaml
