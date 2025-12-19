@@ -227,10 +227,13 @@ def validate_data(**context):
     return validated_path
 
 
+
 # ==================== KUBEFLOW PIPELINE ====================
 def trigger_kubeflow_pipeline(**context):
     """Trigger Kubeflow Pipeline for model training with validated data from MinIO"""
     import kfp
+    import os
+    from kubernetes import client as k8s_client, config as k8s_config
 
     logger.info("Triggering Kubeflow Pipeline for model training")
 
@@ -247,13 +250,42 @@ def trigger_kubeflow_pipeline(**context):
     logger.info(f"Using validated data: {validated_data_path}")
     logger.info(f"Training on {num_records} validated records")
 
-    # Connect to Kubeflow Pipelines
+    # Kubeflow namespace (default user namespace)
+    kf_namespace = 'kubeflow-user-example-com'
+
+    # Connect to Kubeflow Pipelines with authentication
     try:
-        client = kfp.Client(
-            host=config['kubeflow']['pipeline_host']
-        )
+        # Method 1: Try using service account token
+        token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+
+        if os.path.exists(token_path):
+            logger.info("Using Kubernetes service account token for authentication")
+            with open(token_path, 'r') as f:
+                token = f.read().strip()
+
+            # Create KFP client with token
+            kfp_client = kfp.Client(
+                host=config['kubeflow']['pipeline_host'],
+                existing_token=token,
+                namespace=kf_namespace
+            )
+            logger.info("✓ Connected to Kubeflow with service account token")
+
+        else:
+            # Method 2: Try without authentication (if auth is disabled)
+            logger.warning("No service account token found, trying without authentication")
+            kfp_client = kfp.Client(
+                host=config['kubeflow']['pipeline_host'],
+                namespace=kf_namespace
+            )
+            logger.info("✓ Connected to Kubeflow without authentication")
+
     except Exception as e:
         logger.error(f"Failed to connect to Kubeflow: {e}")
+        logger.error("Possible solutions:")
+        logger.error("1. Disable authentication in Kubeflow (for testing)")
+        logger.error("2. Create proper ServiceAccount with RBAC permissions")
+        logger.error("3. Use port-forward and localhost connection")
         raise
 
     # Pipeline parameters - pass the MinIO path of validated data
@@ -281,26 +313,106 @@ def trigger_kubeflow_pipeline(**context):
 
     # Submit pipeline
     try:
-        run = client.create_run_from_pipeline_package(
-            pipeline_file='/opt/airflow/dags/electricity_forecasting_pipeline.yaml',
+        logger.info(f"Submitting pipeline run: {run_name}")
+        logger.info(f"Experiment: {config['mlflow']['experiment_name']}")
+        logger.info(f"Namespace: {kf_namespace}")
+
+        # Check if pipeline file exists
+        pipeline_file = '/opt/airflow/dags/electricity_forecasting_pipeline.yaml'
+        if not os.path.exists(pipeline_file):
+            logger.error(f"Pipeline file not found: {pipeline_file}")
+            raise FileNotFoundError(f"Pipeline YAML not found at {pipeline_file}")
+
+        logger.info(f"Using pipeline file: {pipeline_file}")
+
+        # Create or get experiment
+        try:
+            experiment = kfp_client.get_experiment(experiment_name=config['mlflow']['experiment_name'])
+            logger.info(f"✓ Using existing experiment: {experiment.experiment_id}")
+        except Exception as exp_error:
+            logger.info(f"Creating new experiment: {config['mlflow']['experiment_name']}")
+            try:
+                experiment = kfp_client.create_experiment(
+                    name=config['mlflow']['experiment_name'],
+                    namespace=kf_namespace
+                )
+                logger.info(f"✓ Created experiment: {experiment.experiment_id}")
+            except Exception as create_error:
+                logger.warning(f"Could not create experiment: {create_error}")
+                logger.info("Proceeding without explicit experiment...")
+                experiment = None
+
+        # Submit the run
+        run = kfp_client.create_run_from_pipeline_package(
+            pipeline_file=pipeline_file,
             arguments=pipeline_params,
             run_name=run_name,
-            experiment_name=config['mlflow']['experiment_name']
+            experiment_name=config['mlflow']['experiment_name'] if experiment else None,
+            namespace=kf_namespace
         )
 
-        logger.info(f"✓ Kubeflow pipeline submitted successfully")
+        logger.info("=" * 80)
+        logger.info("✅ Kubeflow pipeline submitted successfully!")
+        logger.info("=" * 80)
         logger.info(f"  Run ID: {run.run_id}")
         logger.info(f"  Run Name: {run_name}")
+        logger.info(f"  Namespace: {kf_namespace}")
         logger.info(f"  Data Source: {validated_data_path}")
+        logger.info(f"  Records: {num_records:,}")
+        logger.info("=" * 80)
+
+        # Optional: Monitor pipeline status
+        logger.info("Note: Pipeline is running asynchronously")
+        logger.info("Check Kubeflow Pipelines UI for progress")
+        logger.info(f"URL: http://localhost:8080 (via port-forward to istio-ingressgateway)")
 
         # Push run info to XCom
         context['task_instance'].xcom_push(key='pipeline_run_id', value=run.run_id)
         context['task_instance'].xcom_push(key='pipeline_run_name', value=run_name)
+        context['task_instance'].xcom_push(key='kf_namespace', value=kf_namespace)
 
         return run.run_id
 
     except Exception as e:
-        logger.error(f"Failed to submit Kubeflow pipeline: {e}")
+        logger.error("=" * 80)
+        logger.error("❌ Failed to submit Kubeflow pipeline")
+        logger.error("=" * 80)
+        logger.error(f"Error: {str(e)}")
+        logger.error(f"Error type: {type(e).__name__}")
+
+        # Provide helpful debugging info
+        if "401" in str(e) or "Unauthorized" in str(e):
+            logger.error("\n🔐 AUTHENTICATION ERROR")
+            logger.error("=" * 80)
+            logger.error("Kubeflow requires authentication. Try one of these:")
+            logger.error("")
+            logger.error("Option 1 (Quick): Disable auth in Kubeflow")
+            logger.error("  kubectl edit deployment ml-pipeline -n kubeflow")
+            logger.error("  Add: KUBEFLOW_USERID_HEADER: \"\"")
+            logger.error("")
+            logger.error("Option 2: Create ServiceAccount with proper RBAC")
+            logger.error("  See documentation for creating kubeflow-pipeline-runner role")
+            logger.error("")
+            logger.error("Option 3: Use port-forward")
+            logger.error("  kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888")
+            logger.error("  Update config.yaml: pipeline_host: http://localhost:8888")
+            logger.error("=" * 80)
+
+        elif "404" in str(e) or "Not Found" in str(e):
+            logger.error("\n📁 PIPELINE FILE ERROR")
+            logger.error("=" * 80)
+            logger.error(f"Pipeline file not found: {pipeline_file}")
+            logger.error("Make sure the compiled pipeline YAML is in the DAGs folder")
+            logger.error("=" * 80)
+
+        elif "Connection" in str(e) or "timeout" in str(e).lower():
+            logger.error("\n🌐 CONNECTION ERROR")
+            logger.error("=" * 80)
+            logger.error(f"Cannot connect to: {config['kubeflow']['pipeline_host']}")
+            logger.error("Check if Kubeflow Pipelines is running:")
+            logger.error("  kubectl get pods -n kubeflow | grep ml-pipeline")
+            logger.error("=" * 80)
+
         raise
 
 
