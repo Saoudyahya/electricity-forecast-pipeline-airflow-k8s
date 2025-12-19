@@ -353,6 +353,7 @@ def trigger_kubeflow_pipeline(**context):
         # Method 1: Try using service account token
         token_path = '/var/run/secrets/kubernetes.io/serviceaccount/token'
 
+        # From this:
         if os.path.exists(token_path):
             logger.info("Using Kubernetes service account token for authentication")
             with open(token_path, 'r') as f:
@@ -365,6 +366,14 @@ def trigger_kubeflow_pipeline(**context):
                 namespace=kf_namespace
             )
             logger.info("✓ Connected to Kubeflow with service account token")
+
+        # To this (skip token, connect without auth):
+        logger.info("Connecting to Kubeflow without authentication")
+        kfp_client = kfp.Client(
+            host=config['kubeflow']['pipeline_host'],
+            namespace=kf_namespace
+        )
+        logger.info("✓ Connected to Kubeflow without authentication")
 
         else:
             # Method 2: Try without authentication (if auth is disabled)
