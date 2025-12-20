@@ -1,14 +1,11 @@
 """
 Fixed Airflow DAG for MLOps Pipeline
-Proper workflow:
+Simplified workflow:
 1. Airflow: Extract data from EIA API → save to MinIO raw/
 2. Airflow: Validate data with Pandera → save to MinIO processed/
-3. Airflow: Compile Kubeflow Pipeline YAML
-4. Airflow: Trigger Kubeflow Pipeline with validated data path
+3. Airflow: Compile Kubeflow Pipeline YAML → save to MinIO pipelines/
+4. Manual: User triggers Kubeflow Pipeline via UI using compiled YAML from MinIO
 5. Kubeflow: Train model, log to MLflow, save artifacts to MinIO
-6. Airflow: (Optional) Trigger Katib HPO
-7. Daily: Batch inference → save predictions to MinIO predictions/
-8. Daily: Drift detection with EvidentlyAI
 """
 
 from airflow import DAG
@@ -229,9 +226,10 @@ def validate_data(**context):
 
 
 # ==================== COMPILE KUBEFLOW PIPELINE ====================
-def compile_kubeflow_pipeline(**context):
-    """Compile Kubeflow pipeline from Python to YAML"""
+def compile_and_upload_pipeline(**context):
+    """Compile Kubeflow pipeline from Python to YAML and upload to MinIO"""
     import subprocess
+    from minio import Minio
 
     logger.info("=" * 80)
     logger.info("Compiling Kubeflow Pipeline")
@@ -239,7 +237,7 @@ def compile_kubeflow_pipeline(**context):
 
     # Paths
     pipeline_script = '/opt/airflow/dags/repo/core/kubeflow_pipeline.py'
-    output_yaml = '/tmp/electricity_forecasting_pipeline.yaml'  # Keep in /tmp/ (writable)
+    output_yaml = '/tmp/electricity_forecasting_pipeline.yaml'
 
     # Check if pipeline script exists
     if not os.path.exists(pipeline_script):
@@ -256,7 +254,7 @@ def compile_kubeflow_pipeline(**context):
             capture_output=True,
             text=True,
             timeout=120,
-            cwd='/tmp'  # Run from /tmp/ (writable directory)
+            cwd='/tmp'
         )
 
         if result.returncode != 0:
@@ -274,7 +272,7 @@ def compile_kubeflow_pipeline(**context):
             if line.strip():
                 logger.info(f"  {line}")
 
-        # Check if YAML was created in /tmp/
+        # Check if YAML was created
         if not os.path.exists(output_yaml):
             logger.error("Pipeline YAML not found. Checking /tmp/:")
             for f in os.listdir('/tmp'):
@@ -295,14 +293,59 @@ def compile_kubeflow_pipeline(**context):
         logger.info(f"✓ Pipeline YAML is valid")
         logger.info(f"  Pipeline name: {pipeline_yaml.get('pipelineInfo', {}).get('name', 'unknown')}")
 
+        # Upload to MinIO
+        logger.info("\nUploading pipeline YAML to MinIO...")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        minio_object_name = f"{config['storage']['pipeline_prefix']}electricity_forecasting_pipeline_{timestamp}.yaml"
+
+        # Initialize MinIO client
+        client = Minio(
+            config['storage']['minio_endpoint'],
+            access_key=config['storage']['minio_access_key'],
+            secret_key=config['storage']['minio_secret_key'],
+            secure=False
+        )
+
+        # Upload to MinIO
+        with open(output_yaml, 'rb') as f:
+            client.put_object(
+                config['storage']['bucket_name'],
+                minio_object_name,
+                f,
+                length=file_size,
+                content_type='application/x-yaml'
+            )
+
+        logger.info(f"✓ Pipeline YAML uploaded to MinIO: s3://{config['storage']['bucket_name']}/{minio_object_name}")
+
         logger.info("=" * 80)
-        logger.info("✅ Pipeline compilation successful!")
+        logger.info("✅ Pipeline compilation and upload successful!")
+        logger.info("=" * 80)
+        logger.info("\n📋 Next Steps:")
+        logger.info("  1. Navigate to Kubeflow Pipelines UI")
+        logger.info("  2. Click 'Upload Pipeline'")
+        logger.info(f"  3. Download pipeline from MinIO: {minio_object_name}")
+        logger.info("  4. Upload the YAML file to Kubeflow")
+        logger.info("  5. Create a run with the validated data path")
         logger.info("=" * 80)
 
-        # Push to XCom - use /tmp/ path
-        context['task_instance'].xcom_push(key='pipeline_yaml_path', value=output_yaml)
+        # Push to XCom
+        context['task_instance'].xcom_push(key='pipeline_yaml_minio_path', value=minio_object_name)
+        context['task_instance'].xcom_push(key='pipeline_yaml_local_path', value=output_yaml)
 
-        return output_yaml
+        # Get validated data path for reference
+        validated_data_path = context['task_instance'].xcom_pull(
+            task_ids='validate_data',
+            key='validated_data_path'
+        )
+
+        logger.info("\n📊 Pipeline Input Parameters:")
+        logger.info(f"  input_object_name: {validated_data_path}")
+        logger.info(f"  bucket_name: {config['storage']['bucket_name']}")
+        logger.info(f"  minio_endpoint: {config['storage']['minio_endpoint']}")
+
+        return minio_object_name
 
     except subprocess.TimeoutExpired:
         logger.error("=" * 80)
@@ -311,699 +354,26 @@ def compile_kubeflow_pipeline(**context):
         raise
     except Exception as e:
         logger.error("=" * 80)
-        logger.error(f"❌ Error during pipeline compilation")
+        logger.error(f"❌ Error during pipeline compilation/upload")
         logger.error("=" * 80)
         logger.error(f"Error: {str(e)}")
         logger.error(f"Error type: {type(e).__name__}")
         raise
 
 
-# ==================== KUBEFLOW PIPELINE ====================
-def trigger_kubeflow_pipeline(**context):
-    """Trigger Kubeflow Pipeline using direct API call with curl"""
-    import subprocess
-    import json
-
-    logger.info("Triggering Kubeflow Pipeline for model training")
-
-    # Get data paths from previous tasks
-    validated_data_path = context['task_instance'].xcom_pull(
-        task_ids='validate_data',
-        key='validated_data_path'
-    )
-    num_records = context['task_instance'].xcom_pull(
-        task_ids='validate_data',
-        key='num_validated_records'
-    )
-    pipeline_yaml_path = context['task_instance'].xcom_pull(
-        task_ids='compile_pipeline',
-        key='pipeline_yaml_path'
-    )
-
-    logger.info(f"Using validated data: {validated_data_path}")
-    logger.info(f"Training on {num_records} validated records")
-    logger.info(f"Using pipeline: {pipeline_yaml_path}")
-
-    kf_namespace = 'kubeflow'
-    api_host = config['kubeflow']['pipeline_host'].rstrip('/')
-
-    # Pipeline parameters
-    pipeline_params = {
-        'input_object_name': validated_data_path,
-        'minio_endpoint': config['storage']['minio_endpoint'],
-        'minio_access_key': config['storage']['minio_access_key'],
-        'minio_secret_key': config['storage']['minio_secret_key'],
-        'bucket_name': config['storage']['bucket_name'],
-        'mlflow_tracking_uri': config['mlflow']['tracking_uri'],
-        'experiment_name': config['mlflow']['experiment_name'],
-        'model_type': 'lstm',
-        'hidden_size': config['model']['hidden_size'],
-        'num_layers': config['model']['num_layers'],
-        'dropout': config['model']['dropout'],
-        'learning_rate': config['model']['learning_rate'],
-        'batch_size': config['model']['batch_size'],
-        'epochs': config['model']['epochs'],
-        'sequence_length': config['model']['sequence_length'],
-        'prediction_horizon': config['model']['prediction_horizon']
-    }
-
-    try:
-        # Step 1: Create or get experiment
-        logger.info("=" * 80)
-        logger.info("Creating/getting experiment...")
-        logger.info("=" * 80)
-
-        experiment_name = "electricity-forecasting"
-        experiment_payload = {
-            "display_name": experiment_name,
-            "description": "Electricity load forecasting experiments",
-            "namespace": kf_namespace  # IMPORTANT - needed for multi-user mode!
-        }
-
-        exp_payload_file = '/tmp/kfp_exp_payload.json'
-        with open(exp_payload_file, 'w') as f:
-            json.dump(experiment_payload, f)
-
-        # Try to create experiment
-        exp_url = f"{api_host}/apis/v2beta1/experiments"
-
-        logger.info(f"Creating experiment at: {exp_url}")
-        logger.info(f"Experiment payload: {experiment_payload}")
-
-        exp_result = subprocess.run([
-            'curl', '-X', 'POST', exp_url,
-            '-H', 'Content-Type: application/json',
-            '-H', 'kubeflow-userid: airflow@kubeflow.org',
-            '-d', f'@{exp_payload_file}',
-            '-w', '\nHTTP_CODE:%{http_code}',
-            '-s'
-        ], capture_output=True, text=True, timeout=30)
-
-        logger.info(f"Experiment creation response: {exp_result.stdout}")
-        if exp_result.stderr:
-            logger.info(f"Experiment creation stderr: {exp_result.stderr}")
-
-        # Parse experiment response
-        experiment_id = None
-        try:
-            # Split by HTTP_CODE if present
-            if 'HTTP_CODE:' in exp_result.stdout:
-                parts = exp_result.stdout.split('HTTP_CODE:')
-                exp_body = parts[0]
-                exp_code = parts[1].strip()
-                logger.info(f"Experiment HTTP Code: {exp_code}")
-            else:
-                exp_body = exp_result.stdout
-
-            exp_response = json.loads(exp_body)
-            experiment_id = exp_response.get('experiment_id')
-            logger.info(f"✓ Created Experiment ID: {experiment_id}")
-
-        except Exception as e:
-            logger.warning(f"Failed to create experiment: {e}")
-            logger.warning(f"Response was: {exp_result.stdout}")
-
-            # If creation fails, try to list and find it
-            logger.info("Listing existing experiments...")
-
-            list_result = subprocess.run([
-                'curl', '-X', 'GET',
-                f"{exp_url}?page_size=100",
-                '-H', 'kubeflow-userid: airflow@kubeflow.org',
-                '-s'
-            ], capture_output=True, text=True, timeout=30)
-
-            logger.info(f"List experiments response: {list_result.stdout}")
-
-            try:
-                list_response = json.loads(list_result.stdout)
-                experiments = list_response.get('experiments', [])
-
-                logger.info(f"Found {len(experiments)} experiments")
-
-                # Find our experiment
-                for exp in experiments:
-                    logger.info(f"  - {exp.get('display_name')}: {exp.get('experiment_id')}")
-                    if exp.get('display_name') == experiment_name:
-                        experiment_id = exp.get('experiment_id')
-                        logger.info(f"✓ Found matching experiment: {experiment_id}")
-                        break
-
-                if not experiment_id and experiments:
-                    # Use first experiment as fallback
-                    experiment_id = experiments[0].get('experiment_id')
-                    logger.info(f"Using first available experiment: {experiment_id}")
-
-                if not experiment_id:
-                    raise Exception("No experiment found or could be created")
-
-            except Exception as e2:
-                logger.error(f"Failed to list experiments: {e2}")
-                logger.error(f"Response was: {list_result.stdout}")
-                raise Exception(f"Could not create or find experiment: {e}, {e2}")
-
-        if not experiment_id:
-            raise Exception("Experiment ID is None - cannot proceed")
-
-        logger.info(f"✓ Using Experiment ID: {experiment_id}")
-        logger.info("=" * 80)
-
-        # Step 2: Submit pipeline run with experiment_id
-        run_name = f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        logger.info(f"Submitting pipeline run: {run_name}")
-
-        if not os.path.exists(pipeline_yaml_path):
-            raise FileNotFoundError(f"Pipeline YAML not found at {pipeline_yaml_path}")
-
-        # Read pipeline YAML
-        with open(pipeline_yaml_path, 'r') as f:
-            pipeline_spec = f.read()
-
-        # Prepare the payload WITH experiment_id
-        payload = {
-            "display_name": run_name,
-            "description": f"Training run triggered by Airflow with {num_records} records",
-            "experiment_id": experiment_id,  # IMPORTANT!
-            "pipeline_spec": {
-                "pipeline_spec": pipeline_spec
-            },
-            "runtime_config": {
-                "parameters": pipeline_params
-            },
-            "service_account": "default-editor"
-        }
-
-        # Save payload to temp file
-        payload_file = '/tmp/kfp_payload.json'
-        with open(payload_file, 'w') as f:
-            json.dump(payload, f, indent=2)
-
-        logger.info(f"Payload saved to {payload_file}")
-        logger.info(f"Experiment ID in payload: {payload['experiment_id']}")
-
-        # Make curl request
-        api_url = f"{api_host}/apis/v2beta1/runs"
-
-        curl_command = [
-            'curl', '-X', 'POST', api_url,
-            '-H', 'Content-Type: application/json',
-            '-H', 'kubeflow-userid: airflow@kubeflow.org',
-            '-d', f'@{payload_file}',
-            '-w', '\nHTTP_CODE:%{http_code}',
-            '-s'
-        ]
-
-        logger.info(f"Executing: {' '.join(curl_command)}")
-
-        result = subprocess.run(
-            curl_command,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-
-        # Parse response
-        output = result.stdout
-
-        if 'HTTP_CODE:' in output:
-            parts = output.split('HTTP_CODE:')
-            response_body = parts[0]
-            http_code = parts[1].strip()
-        else:
-            response_body = output
-            http_code = "unknown"
-
-        logger.info(f"HTTP Status Code: {http_code}")
-        logger.info(f"Response body: {response_body}")
-
-        # Check for success
-        if http_code.startswith('2'):
-            try:
-                response_json = json.loads(response_body)
-                run_id = response_json.get('run_id', 'unknown')
-
-                logger.info("=" * 80)
-                logger.info("✅ Kubeflow pipeline submitted successfully!")
-                logger.info("=" * 80)
-                logger.info(f"  Run ID: {run_id}")
-                logger.info(f"  Run Name: {run_name}")
-                logger.info(f"  Experiment ID: {experiment_id}")
-                logger.info(f"  Data Source: {validated_data_path}")
-                logger.info(f"  Records: {num_records:,}")
-                logger.info("=" * 80)
-
-                # Push run info to XCom
-                context['task_instance'].xcom_push(key='pipeline_run_id', value=run_id)
-                context['task_instance'].xcom_push(key='pipeline_run_name', value=run_name)
-                context['task_instance'].xcom_push(key='experiment_id', value=experiment_id)
-                context['task_instance'].xcom_push(key='kf_namespace', value=kf_namespace)
-
-                return run_id
-
-            except json.JSONDecodeError as e:
-                logger.warning(f"Could not parse response as JSON: {e}")
-                logger.info("Pipeline likely submitted successfully")
-                return run_name
-
-        else:
-            logger.error("=" * 80)
-            logger.error("❌ Failed to submit Kubeflow pipeline")
-            logger.error("=" * 80)
-            logger.error(f"HTTP Status: {http_code}")
-            logger.error(f"Response: {response_body}")
-
-            if result.stderr:
-                logger.error(f"Stderr: {result.stderr}")
-
-            raise Exception(f"Failed to submit pipeline. HTTP {http_code}: {response_body}")
-
-    except subprocess.TimeoutExpired:
-        logger.error("Curl request timed out")
-        raise
-    except Exception as e:
-        logger.error("=" * 80)
-        logger.error("❌ Failed to submit Kubeflow pipeline")
-        logger.error("=" * 80)
-        logger.error(f"Error: {str(e)}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
-
-
-# ==================== KATIB HPO ====================
-def trigger_katib_hpo(**context):
-    """Trigger Katib HPO experiment for hyperparameter optimization"""
-    import subprocess
-    import time
-
-    logger.info("Triggering Katib HPO experiment")
-
-    # Get validated data path to pass to Katib
-    validated_data_path = context['task_instance'].xcom_pull(
-        task_ids='validate_data',
-        key='validated_data_path'
-    )
-
-    logger.info(f"HPO will use data: {validated_data_path}")
-
-    # Apply Katib experiment
-    try:
-        result = subprocess.run(
-            ['kubectl', 'apply', '-f', '/opt/airflow/dags/katib-experiment.yaml'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-
-        if result.returncode != 0:
-            logger.error(f"Failed to create Katib experiment: {result.stderr}")
-            raise Exception(f"Katib experiment creation failed: {result.stderr}")
-
-        logger.info("✓ Katib experiment created successfully")
-
-        # Wait a bit for experiment to initialize
-        time.sleep(10)
-
-        # Get experiment status
-        status_result = subprocess.run(
-            ['kubectl', 'get', 'experiment', 'electricity-forecast-hpo',
-             '-n', config['kubeflow']['namespace'], '-o', 'json'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-
-        if status_result.returncode == 0:
-            experiment_status = json.loads(status_result.stdout)
-            status = experiment_status.get('status', {})
-            logger.info(f"✓ Experiment status: {status.get('conditions', [])}")
-
-        # Push to XCom
-        context['task_instance'].xcom_push(key='katib_experiment', value='electricity-forecast-hpo')
-
-        return "Katib HPO experiment triggered successfully"
-
-    except subprocess.TimeoutExpired:
-        logger.error("Kubectl command timed out")
-        raise
-    except Exception as e:
-        logger.error(f"Error triggering Katib: {e}")
-        raise
-
-
-# ==================== BATCH INFERENCE ====================
-def get_latest_model_from_mlflow(**context):
-    """Get the latest production model from MLflow"""
-    import mlflow
-    from mlflow.tracking import MlflowClient
-
-    logger.info("Fetching latest model from MLflow")
-
-    mlflow.set_tracking_uri(config['mlflow']['tracking_uri'])
-    client = MlflowClient()
-
-    model_name = "electricity-load-forecaster"
-
-    try:
-        # Search for model versions
-        versions = client.search_model_versions(f"name='{model_name}'")
-
-        if not versions:
-            logger.warning("⚠️ No model versions found in MLflow")
-            return None
-
-        # Prefer production models, otherwise use latest
-        production_versions = [v for v in versions if v.current_stage == 'Production']
-
-        if production_versions:
-            latest_version = max(production_versions, key=lambda x: int(x.version))
-            logger.info(f"✓ Using Production model version {latest_version.version}")
-        else:
-            latest_version = max(versions, key=lambda x: int(x.version))
-            logger.info(f"✓ Using latest model version {latest_version.version} (Stage: {latest_version.current_stage})")
-
-        # Create model URI
-        model_uri = f"models:/{model_name}/{latest_version.version}"
-
-        logger.info(f"✓ Model URI: {model_uri}")
-
-        # Push to XCom
-        context['task_instance'].xcom_push(key='model_version', value=str(latest_version.version))
-        context['task_instance'].xcom_push(key='model_uri', value=model_uri)
-        context['task_instance'].xcom_push(key='model_stage', value=latest_version.current_stage)
-
-        return model_uri
-
-    except Exception as e:
-        logger.error(f"❌ Error fetching model from MLflow: {e}")
-        raise
-
-
-def batch_inference(**context):
-    """Run batch inference and save predictions to MinIO predictions/"""
-    import mlflow
-    import mlflow.pytorch
-    import torch
-    from minio import Minio
-
-    logger.info("Starting batch inference")
-
-    # Get model from previous task
-    model_uri = context['task_instance'].xcom_pull(
-        task_ids='get_latest_model',
-        key='model_uri'
-    )
-    model_version = context['task_instance'].xcom_pull(
-        task_ids='get_latest_model',
-        key='model_version'
-    )
-
-    if model_uri is None:
-        logger.warning("⚠️ No model available, skipping inference")
-        return "No model available"
-
-    logger.info(f"Using model: {model_uri} (v{model_version})")
-
-    # Load model from MLflow
-    mlflow.set_tracking_uri(config['mlflow']['tracking_uri'])
-
-    try:
-        model = mlflow.pytorch.load_model(model_uri)
-        logger.info("✓ Model loaded from MLflow")
-    except Exception as e:
-        logger.error(f"❌ Failed to load model: {e}")
-        raise
-
-    # Initialize MinIO client
-    client = Minio(
-        config['storage']['minio_endpoint'],
-        access_key=config['storage']['minio_access_key'],
-        secret_key=config['storage']['minio_secret_key'],
-        secure=False
-    )
-
-    # Get latest processed data
-    objects = client.list_objects(
-        config['storage']['bucket_name'],
-        prefix=config['storage']['processed_data_prefix']
-    )
-    objects_list = list(objects)
-
-    if not objects_list:
-        logger.warning("⚠️ No processed data found in MinIO")
-        return "No data available"
-
-    # Get most recent data
-    latest_object = max(objects_list, key=lambda x: x.last_modified)
-    logger.info(f"Using data: {latest_object.object_name}")
-
-    response = client.get_object(
-        config['storage']['bucket_name'],
-        latest_object.object_name
-    )
-    df = pd.read_csv(BytesIO(response.read()))
-    df['period'] = pd.to_datetime(df['period'])
-
-    # Select region (use region with most data)
-    if 'respondent' in df.columns:
-        region_counts = df['respondent'].value_counts()
-        selected_region = region_counts.index[0]
-        df = df[df['respondent'] == selected_region].copy()
-        logger.info(f"Selected region: {selected_region}")
-
-    df = df.sort_values('period').reset_index(drop=True)
-
-    # Prepare input (last sequence_length hours)
-    sequence_length = config['model']['sequence_length']
-
-    if len(df) < sequence_length:
-        raise ValueError(f"Need at least {sequence_length} records, got {len(df)}")
-
-    input_data = df['value'].values[-sequence_length:].reshape(-1, 1)
-
-    # Scale data
-    from sklearn.preprocessing import MinMaxScaler
-    scaler = MinMaxScaler()
-    scaler.fit(df['value'].values.reshape(-1, 1))
-    input_scaled = scaler.transform(input_data)
-
-    # Make predictions
-    model.eval()
-    with torch.no_grad():
-        input_tensor = torch.FloatTensor(input_scaled).unsqueeze(0)
-        predictions = model(input_tensor).numpy().flatten()
-
-    # Inverse transform
-    predictions_scaled = scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
-
-    # Create predictions dataframe
-    last_timestamp = df['period'].iloc[-1]
-    future_timestamps = pd.date_range(
-        start=last_timestamp + timedelta(hours=1),
-        periods=len(predictions_scaled),
-        freq='H'
-    )
-
-    predictions_df = pd.DataFrame({
-        'timestamp': future_timestamps,
-        'predicted_load_MW': predictions_scaled,
-        'model_version': model_version,
-        'region': selected_region if 'respondent' in df.columns else 'unknown'
-    })
-
-    # Save predictions to MinIO predictions/
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    predictions_path = f"{config['storage']['predictions_prefix']}predictions_{timestamp}.csv"
-
-    csv_bytes = predictions_df.to_csv(index=False).encode('utf-8')
-    csv_buffer = BytesIO(csv_bytes)
-
-    client.put_object(
-        config['storage']['bucket_name'],
-        predictions_path,
-        csv_buffer,
-        length=len(csv_bytes),
-        content_type='text/csv'
-    )
-
-    logger.info(f"✓ Predictions saved to MinIO: s3://{config['storage']['bucket_name']}/{predictions_path}")
-    logger.info(f"  Predicted {len(predictions_df)} hours ahead")
-    logger.info(f"  Mean predicted load: {predictions_scaled.mean():.2f} MW")
-
-    # Push to XCom (convert to Python types)
-    context['task_instance'].xcom_push(key='predictions_path', value=predictions_path)
-    context['task_instance'].xcom_push(key='num_predictions', value=int(len(predictions_df)))
-    context['task_instance'].xcom_push(key='mean_prediction', value=float(predictions_scaled.mean()))
-
-    return predictions_path
-
-
-# ==================== DRIFT DETECTION ====================
-def detect_drift(**context):
-    """Detect data and model drift using EvidentlyAI"""
-    from evidently import ColumnMapping
-    from evidently.report import Report
-    from evidently.metric_preset import DataDriftPreset
-    from evidently.metrics import DatasetDriftMetric, DatasetMissingValuesMetric
-    from minio import Minio
-
-    logger.info("Starting drift detection")
-
-    client = Minio(
-        config['storage']['minio_endpoint'],
-        access_key=config['storage']['minio_access_key'],
-        secret_key=config['storage']['minio_secret_key'],
-        secure=False
-    )
-
-    # Get processed data
-    objects = list(client.list_objects(
-        config['storage']['bucket_name'],
-        prefix=config['storage']['processed_data_prefix']
-    ))
-
-    if len(objects) < 2:
-        logger.warning("⚠️ Not enough data for drift detection (need at least 2 datasets)")
-        return "Insufficient data"
-
-    # Sort by date
-    objects_sorted = sorted(objects, key=lambda x: x.last_modified, reverse=True)
-
-    # Get current data (most recent)
-    current_object = objects_sorted[0]
-    response = client.get_object(config['storage']['bucket_name'], current_object.object_name)
-    current_df = pd.read_csv(BytesIO(response.read()))
-    current_df['period'] = pd.to_datetime(current_df['period'])
-    logger.info(f"Current data: {current_object.object_name} ({len(current_df)} records)")
-
-    # Get reference data (oldest available)
-    reference_object = objects_sorted[-1]
-    response = client.get_object(config['storage']['bucket_name'], reference_object.object_name)
-    reference_df = pd.read_csv(BytesIO(response.read()))
-    reference_df['period'] = pd.to_datetime(reference_df['period'])
-    logger.info(f"Reference data: {reference_object.object_name} ({len(reference_df)} records)")
-
-    # Filter to same region
-    if 'respondent' in current_df.columns:
-        region = current_df['respondent'].value_counts().index[0]
-        current_df = current_df[current_df['respondent'] == region]
-        reference_df = reference_df[reference_df['respondent'] == region]
-        logger.info(f"Analyzing region: {region}")
-
-    # Select features for drift detection
-    feature_columns = ['value']
-
-    # Create column mapping
-    column_mapping = ColumnMapping()
-    column_mapping.target = 'value'
-
-    # Create drift report
-    drift_report = Report(metrics=[
-        DataDriftPreset(),
-        DatasetDriftMetric(),
-        DatasetMissingValuesMetric()
-    ])
-
-    drift_report.run(
-        reference_data=reference_df[feature_columns],
-        current_data=current_df[feature_columns],
-        column_mapping=column_mapping
-    )
-
-    # Save HTML report
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"/tmp/drift_report_{timestamp}.html"
-    drift_report.save_html(report_path)
-
-    # Get drift metrics
-    report_dict = drift_report.as_dict()
-
-    # Parse drift results
-    drift_detected = False
-    drift_share = 0.0
-
-    try:
-        dataset_drift = report_dict['metrics'][1]['result']
-        drift_detected = dataset_drift.get('dataset_drift', False)
-        drift_share = dataset_drift.get('drift_share', 0.0)
-    except (KeyError, IndexError) as e:
-        logger.warning(f"Could not parse drift metrics: {e}")
-
-    # Save HTML report to MinIO
-    with open(report_path, 'rb') as f:
-        file_size = os.path.getsize(report_path)
-        client.put_object(
-            config['storage']['bucket_name'],
-            f"drift_reports/drift_report_{timestamp}.html",
-            f,
-            length=file_size,
-            content_type='text/html'
-        )
-    logger.info(f"✓ Drift report saved to MinIO")
-
-    # Save drift metrics JSON (with proper encoding)
-    drift_metrics = {
-        'timestamp': timestamp,
-        'drift_detected': bool(drift_detected),
-        'drift_share': float(drift_share),
-        'threshold': float(config['drift_detection']['drift_threshold']),
-        'reference_data': {
-            'source': reference_object.object_name,
-            'size': int(len(reference_df)),
-            'date_range': f"{reference_df['period'].min()} to {reference_df['period'].max()}"
-        },
-        'current_data': {
-            'source': current_object.object_name,
-            'size': int(len(current_df)),
-            'date_range': f"{current_df['period'].min()} to {current_df['period'].max()}"
-        }
-    }
-
-    metrics_bytes = json.dumps(drift_metrics, indent=2, cls=NumpyEncoder).encode('utf-8')
-    metrics_buffer = BytesIO(metrics_bytes)
-
-    client.put_object(
-        config['storage']['bucket_name'],
-        f"drift_reports/drift_metrics_{timestamp}.json",
-        metrics_buffer,
-        length=len(metrics_bytes),
-        content_type='application/json'
-    )
-
-    logger.info(f"✓ Drift detection complete")
-    logger.info(f"  Drift detected: {drift_detected}")
-    logger.info(f"  Drift share: {drift_share:.2%}")
-    logger.info(f"  Threshold: {config['drift_detection']['drift_threshold']:.2%}")
-
-    # Push to XCom
-    context['task_instance'].xcom_push(key='drift_detected', value=bool(drift_detected))
-    context['task_instance'].xcom_push(key='drift_share', value=float(drift_share))
-
-    # Alert if drift detected
-    if drift_detected or drift_share > config['drift_detection']['drift_threshold']:
-        logger.warning("=" * 60)
-        logger.warning("⚠️ DRIFT ALERT!")
-        logger.warning(f"   Data drift detected with {drift_share:.2%} drift share")
-        logger.warning(f"   Threshold: {config['drift_detection']['drift_threshold']:.2%}")
-        logger.warning("   Consider retraining the model")
-        logger.warning("=" * 60)
-
-    return drift_metrics
-
-
 # ===================================================================
-# DAG DEFINITIONS
+# DAG DEFINITION
 # ===================================================================
 
-# DAG 1: Weekly Training Pipeline
+# Weekly Training Pipeline Preparation
 with DAG(
-    'electricity_training_pipeline',
+    'electricity_pipeline_preparation',
     default_args=default_args,
-    description='Weekly ML pipeline: Extract → Validate → Compile → Train with Kubeflow → Log to MLflow',
+    description='Weekly pipeline: Extract → Validate → Compile Pipeline → Store in MinIO',
     schedule='0 0 * * 0',  # Every Sunday at midnight
     start_date=datetime(2025, 1, 1),
     catchup=False,
-    tags=['mlops', 'training', 'kubeflow', 'mlflow', 'minio'],
+    tags=['mlops', 'data-preparation', 'kubeflow', 'minio'],
 ) as training_dag:
 
     # Task 1: Extract data from EIA API → save to MinIO raw/
@@ -1018,53 +388,14 @@ with DAG(
         python_callable=validate_data,
     )
 
-    # Task 3: Compile Kubeflow Pipeline to YAML
-    compile_pipeline_task = PythonOperator(
-        task_id='compile_pipeline',
-        python_callable=compile_kubeflow_pipeline,
-    )
-
-    # Task 4: Trigger Kubeflow Pipeline (trains model, logs to MLflow)
-    trigger_kfp = PythonOperator(
-        task_id='trigger_kubeflow_pipeline',
-        python_callable=trigger_kubeflow_pipeline,
+    # Task 3: Compile Kubeflow Pipeline YAML → save to MinIO pipelines/
+    compile_and_upload_task = PythonOperator(
+        task_id='compile_and_upload_pipeline',
+        python_callable=compile_and_upload_pipeline,
     )
 
     # Define task dependencies
-    extract_task >> validate_task >> compile_pipeline_task >> trigger_kfp
-
-
-# DAG 2: Daily Inference and Monitoring
-with DAG(
-    'electricity_daily_inference',
-    default_args=default_args,
-    description='Daily: Batch inference → Save predictions to MinIO → Drift detection',
-    schedule='0 2 * * *',  # Every day at 2 AM
-    start_date=datetime(2025, 1, 1),
-    catchup=False,
-    tags=['mlops', 'inference', 'drift-detection', 'minio', 'mlflow'],
-) as inference_dag:
-
-    # Task 1: Get latest model from MLflow
-    get_model = PythonOperator(
-        task_id='get_latest_model',
-        python_callable=get_latest_model_from_mlflow,
-    )
-
-    # Task 2: Run batch inference → save to MinIO predictions/
-    inference = PythonOperator(
-        task_id='batch_inference',
-        python_callable=batch_inference,
-    )
-
-    # Task 3: Detect drift with EvidentlyAI
-    drift_detection = PythonOperator(
-        task_id='detect_drift',
-        python_callable=detect_drift,
-    )
-
-    # Define task dependencies
-    get_model >> inference >> drift_detection
+    extract_task >> validate_task >> compile_and_upload_task
 
 
 # ===================================================================
@@ -1105,14 +436,14 @@ if __name__ == '__main__':
     print("\n📊 Integration Flow:")
     print("  1. Airflow extracts data from EIA → MinIO raw/")
     print("  2. Airflow validates data → MinIO processed/")
-    print("  3. Airflow triggers THIS Kubeflow pipeline")
-    print("  4. Kubeflow trains model → MLflow + MinIO")
-    print("  5. Model ready for inference!")
+    print("  3. Airflow compiles & stores pipeline YAML → MinIO pipelines/")
+    print("  4. User triggers Kubeflow pipeline manually via UI")
+    print("  5. Kubeflow trains model → MLflow + MinIO")
+    print("  6. Model ready for use!")
     print("\n💾 Storage:")
     print("  • Training data:  MinIO (processed/)")
+    print("  • Pipeline YAML:  MinIO (pipelines/)")
     print("  • Model artifacts: MinIO (via MLflow)")
     print("  • Experiments:     MLflow tracking server")
     print("  • Model registry:  MLflow Model Registry")
     print("=" * 80)
-
-

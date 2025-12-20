@@ -14,11 +14,12 @@ storage:
   raw_data_prefix: "raw/"
   processed_data_prefix: "processed/"
   predictions_prefix: "predictions/"
+  pipeline_prefix: "pipelines/"  # NEW: Store compiled Kubeflow pipeline YAMLs
 
 mlflow:
   tracking_uri: "http://mlflow.mlflow.svc.cluster.local:5000"
   experiment_name: "electricity-load-forecasting"
-  
+
 kubeflow:
   pipeline_host: "http://ml-pipeline.kubeflow.svc.cluster.local:8888"
   namespace: "kubeflow"
