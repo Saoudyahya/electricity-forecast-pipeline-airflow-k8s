@@ -320,30 +320,175 @@ def compile_kubeflow_pipeline(**context):
 
 # ==================== KUBEFLOW PIPELINE ====================
 def trigger_kubeflow_pipeline(**context):
-    """Trigger pipeline using direct API call"""
+    """Trigger Kubeflow Pipeline using direct API call with curl"""
     import subprocess
     import json
 
-    # Prepare the API request
-    api_url = f"{config['kubeflow']['pipeline_host']}/apis/v2beta1/runs"
+    logger.info("Triggering Kubeflow Pipeline for model training")
 
-    payload = {
-        "display_name": f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-        "pipeline_spec": open(pipeline_yaml_path).read(),
-        "runtime_config": {
-            "parameters": pipeline_params
-        }
+    # Get data paths from previous tasks
+    validated_data_path = context['task_instance'].xcom_pull(
+        task_ids='validate_data',
+        key='validated_data_path'
+    )
+    num_records = context['task_instance'].xcom_pull(
+        task_ids='validate_data',
+        key='num_validated_records'
+    )
+    pipeline_yaml_path = context['task_instance'].xcom_pull(
+        task_ids='compile_pipeline',
+        key='pipeline_yaml_path'
+    )
+
+    logger.info(f"Using validated data: {validated_data_path}")
+    logger.info(f"Training on {num_records} validated records")
+    logger.info(f"Using pipeline: {pipeline_yaml_path}")
+
+    kf_namespace = 'kubeflow'
+
+    # Pipeline parameters
+    pipeline_params = {
+        'input_object_name': validated_data_path,
+        'minio_endpoint': config['storage']['minio_endpoint'],
+        'minio_access_key': config['storage']['minio_access_key'],
+        'minio_secret_key': config['storage']['minio_secret_key'],
+        'bucket_name': config['storage']['bucket_name'],
+        'mlflow_tracking_uri': config['mlflow']['tracking_uri'],
+        'experiment_name': config['mlflow']['experiment_name'],
+        'model_type': 'lstm',
+        'hidden_size': config['model']['hidden_size'],
+        'num_layers': config['model']['num_layers'],
+        'dropout': config['model']['dropout'],
+        'learning_rate': config['model']['learning_rate'],
+        'batch_size': config['model']['batch_size'],
+        'epochs': config['model']['epochs'],
+        'sequence_length': config['model']['sequence_length'],
+        'prediction_horizon': config['model']['prediction_horizon']
     }
 
-    # Make request with header
-    result = subprocess.run([
-        'curl', '-X', 'POST', api_url,
-        '-H', 'Content-Type: application/json',
-        '-H', 'kubeflow-userid: airflow@kubeflow.org',
-        '-d', json.dumps(payload)
-    ], capture_output=True, text=True)
+    # Create run name
+    run_name = f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-    logger.info(f"Response: {result.stdout}")
+    try:
+        logger.info(f"Submitting pipeline run: {run_name}")
+
+        if not os.path.exists(pipeline_yaml_path):
+            raise FileNotFoundError(f"Pipeline YAML not found at {pipeline_yaml_path}")
+
+        # Read pipeline YAML
+        with open(pipeline_yaml_path, 'r') as f:
+            pipeline_spec = f.read()
+
+        # Kubeflow API endpoint
+        api_host = config['kubeflow']['pipeline_host'].rstrip('/')
+        api_url = f"{api_host}/apis/v2beta1/runs"
+
+        logger.info(f"API URL: {api_url}")
+
+        # Prepare the payload
+        payload = {
+            "display_name": run_name,
+            "description": f"Training run triggered by Airflow with {num_records} records",
+            "pipeline_spec": {
+                "pipeline_spec": pipeline_spec
+            },
+            "runtime_config": {
+                "parameters": pipeline_params
+            },
+            "service_account": "default-editor"
+        }
+
+        # Save payload to temp file
+        payload_file = '/tmp/kfp_payload.json'
+        with open(payload_file, 'w') as f:
+            json.dump(payload, f, indent=2)
+
+        logger.info(f"Payload saved to {payload_file}")
+
+        # Make curl request with kubeflow-userid header
+        curl_command = [
+            'curl', '-X', 'POST',
+            api_url,
+            '-H', 'Content-Type: application/json',
+            '-H', 'kubeflow-userid: airflow@kubeflow.org',
+            '-d', f'@{payload_file}',
+            '-w', '\nHTTP_CODE:%{http_code}',
+            '-s'
+        ]
+
+        logger.info(f"Executing: {' '.join(curl_command)}")
+
+        result = subprocess.run(
+            curl_command,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        # Parse response
+        output = result.stdout
+
+        # Extract HTTP code
+        if 'HTTP_CODE:' in output:
+            parts = output.split('HTTP_CODE:')
+            response_body = parts[0]
+            http_code = parts[1].strip()
+        else:
+            response_body = output
+            http_code = "unknown"
+
+        logger.info(f"HTTP Status Code: {http_code}")
+        logger.info(f"Response body: {response_body}")
+
+        # Check for success
+        if http_code.startswith('2'):  # 200-299 = success
+            try:
+                response_json = json.loads(response_body)
+                run_id = response_json.get('run_id', 'unknown')
+
+                logger.info("=" * 80)
+                logger.info("✅ Kubeflow pipeline submitted successfully!")
+                logger.info("=" * 80)
+                logger.info(f"  Run ID: {run_id}")
+                logger.info(f"  Run Name: {run_name}")
+                logger.info(f"  Data Source: {validated_data_path}")
+                logger.info(f"  Records: {num_records:,}")
+                logger.info("=" * 80)
+
+                # Push run info to XCom
+                context['task_instance'].xcom_push(key='pipeline_run_id', value=run_id)
+                context['task_instance'].xcom_push(key='pipeline_run_name', value=run_name)
+                context['task_instance'].xcom_push(key='kf_namespace', value=kf_namespace)
+
+                return run_id
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"Could not parse response as JSON: {e}")
+                logger.info("Pipeline likely submitted successfully")
+                return run_name
+
+        else:
+            # Error occurred
+            logger.error("=" * 80)
+            logger.error("❌ Failed to submit Kubeflow pipeline")
+            logger.error("=" * 80)
+            logger.error(f"HTTP Status: {http_code}")
+            logger.error(f"Response: {response_body}")
+
+            if result.stderr:
+                logger.error(f"Stderr: {result.stderr}")
+
+            raise Exception(f"Failed to submit pipeline. HTTP {http_code}: {response_body}")
+
+    except subprocess.TimeoutExpired:
+        logger.error("Curl request timed out after 30 seconds")
+        raise
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error("❌ Failed to submit Kubeflow pipeline")
+        logger.error("=" * 80)
+        logger.error(f"Error: {str(e)}")
+        raise
 
 
 # ==================== KATIB HPO ====================
