@@ -345,6 +345,7 @@ def trigger_kubeflow_pipeline(**context):
     logger.info(f"Using pipeline: {pipeline_yaml_path}")
 
     kf_namespace = 'kubeflow'
+    api_host = config['kubeflow']['pipeline_host'].rstrip('/')
 
     # Pipeline parameters
     pipeline_params = {
@@ -366,10 +367,72 @@ def trigger_kubeflow_pipeline(**context):
         'prediction_horizon': config['model']['prediction_horizon']
     }
 
-    # Create run name
-    run_name = f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-
     try:
+        # Step 1: Create or get experiment
+        logger.info("Creating/getting experiment...")
+
+        experiment_name = "electricity-forecasting"
+        experiment_payload = {
+            "display_name": experiment_name,
+            "description": "Electricity load forecasting experiments"
+        }
+
+        exp_payload_file = '/tmp/kfp_exp_payload.json'
+        with open(exp_payload_file, 'w') as f:
+            json.dump(experiment_payload, f)
+
+        # Try to create experiment
+        exp_url = f"{api_host}/apis/v2beta1/experiments"
+
+        exp_result = subprocess.run([
+            'curl', '-X', 'POST', exp_url,
+            '-H', 'Content-Type: application/json',
+            '-H', 'kubeflow-userid: airflow@kubeflow.org',
+            '-d', f'@{exp_payload_file}',
+            '-s'
+        ], capture_output=True, text=True, timeout=30)
+
+        # Parse experiment response
+        try:
+            exp_response = json.loads(exp_result.stdout)
+            experiment_id = exp_response.get('experiment_id')
+            logger.info(f"✓ Experiment ID: {experiment_id}")
+        except:
+            # If creation fails, try to list and find it
+            logger.info("Experiment may already exist, listing experiments...")
+
+            list_result = subprocess.run([
+                'curl', '-X', 'GET',
+                f"{exp_url}?page_size=100",
+                '-H', 'kubeflow-userid: airflow@kubeflow.org',
+                '-s'
+            ], capture_output=True, text=True, timeout=30)
+
+            try:
+                list_response = json.loads(list_result.stdout)
+                experiments = list_response.get('experiments', [])
+
+                # Find our experiment
+                experiment_id = None
+                for exp in experiments:
+                    if exp.get('display_name') == experiment_name:
+                        experiment_id = exp.get('experiment_id')
+                        break
+
+                if not experiment_id and experiments:
+                    # Use first experiment as fallback
+                    experiment_id = experiments[0].get('experiment_id')
+                    logger.info(f"Using existing experiment: {experiment_id}")
+
+                if not experiment_id:
+                    raise Exception("No experiment found or could be created")
+
+            except Exception as e:
+                logger.error(f"Failed to get experiment: {e}")
+                raise
+
+        # Step 2: Submit pipeline run with experiment_id
+        run_name = f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         logger.info(f"Submitting pipeline run: {run_name}")
 
         if not os.path.exists(pipeline_yaml_path):
@@ -379,16 +442,11 @@ def trigger_kubeflow_pipeline(**context):
         with open(pipeline_yaml_path, 'r') as f:
             pipeline_spec = f.read()
 
-        # Kubeflow API endpoint
-        api_host = config['kubeflow']['pipeline_host'].rstrip('/')
-        api_url = f"{api_host}/apis/v2beta1/runs"
-
-        logger.info(f"API URL: {api_url}")
-
-        # Prepare the payload
+        # Prepare the payload WITH experiment_id
         payload = {
             "display_name": run_name,
             "description": f"Training run triggered by Airflow with {num_records} records",
+            "experiment_id": experiment_id,  # IMPORTANT!
             "pipeline_spec": {
                 "pipeline_spec": pipeline_spec
             },
@@ -405,10 +463,11 @@ def trigger_kubeflow_pipeline(**context):
 
         logger.info(f"Payload saved to {payload_file}")
 
-        # Make curl request with kubeflow-userid header
+        # Make curl request
+        api_url = f"{api_host}/apis/v2beta1/runs"
+
         curl_command = [
-            'curl', '-X', 'POST',
-            api_url,
+            'curl', '-X', 'POST', api_url,
             '-H', 'Content-Type: application/json',
             '-H', 'kubeflow-userid: airflow@kubeflow.org',
             '-d', f'@{payload_file}',
@@ -428,7 +487,6 @@ def trigger_kubeflow_pipeline(**context):
         # Parse response
         output = result.stdout
 
-        # Extract HTTP code
         if 'HTTP_CODE:' in output:
             parts = output.split('HTTP_CODE:')
             response_body = parts[0]
@@ -441,7 +499,7 @@ def trigger_kubeflow_pipeline(**context):
         logger.info(f"Response body: {response_body}")
 
         # Check for success
-        if http_code.startswith('2'):  # 200-299 = success
+        if http_code.startswith('2'):
             try:
                 response_json = json.loads(response_body)
                 run_id = response_json.get('run_id', 'unknown')
@@ -451,6 +509,7 @@ def trigger_kubeflow_pipeline(**context):
                 logger.info("=" * 80)
                 logger.info(f"  Run ID: {run_id}")
                 logger.info(f"  Run Name: {run_name}")
+                logger.info(f"  Experiment ID: {experiment_id}")
                 logger.info(f"  Data Source: {validated_data_path}")
                 logger.info(f"  Records: {num_records:,}")
                 logger.info("=" * 80)
@@ -458,6 +517,7 @@ def trigger_kubeflow_pipeline(**context):
                 # Push run info to XCom
                 context['task_instance'].xcom_push(key='pipeline_run_id', value=run_id)
                 context['task_instance'].xcom_push(key='pipeline_run_name', value=run_name)
+                context['task_instance'].xcom_push(key='experiment_id', value=experiment_id)
                 context['task_instance'].xcom_push(key='kf_namespace', value=kf_namespace)
 
                 return run_id
@@ -468,7 +528,6 @@ def trigger_kubeflow_pipeline(**context):
                 return run_name
 
         else:
-            # Error occurred
             logger.error("=" * 80)
             logger.error("❌ Failed to submit Kubeflow pipeline")
             logger.error("=" * 80)
@@ -481,7 +540,7 @@ def trigger_kubeflow_pipeline(**context):
             raise Exception(f"Failed to submit pipeline. HTTP {http_code}: {response_body}")
 
     except subprocess.TimeoutExpired:
-        logger.error("Curl request timed out after 30 seconds")
+        logger.error("Curl request timed out")
         raise
     except Exception as e:
         logger.error("=" * 80)
