@@ -225,6 +225,52 @@ def validate_data(**context):
     return validated_path
 
 
+# ==================== ENSURE MINIO BUCKETS ====================
+def ensure_minio_buckets(**context):
+    """Ensure all required MinIO buckets exist"""
+    from minio import Minio
+
+    logger.info("Checking MinIO buckets...")
+
+    # Initialize MinIO client
+    client = Minio(
+        config['storage']['minio_endpoint'],
+        access_key=config['storage']['minio_access_key'],
+        secret_key=config['storage']['minio_secret_key'],
+        secure=False
+    )
+
+    # Required buckets
+    required_buckets = [
+        config['storage']['bucket_name'],
+        'mlflow-artifacts',
+        'kubeflow-pipelines'
+    ]
+
+    created_buckets = []
+    existing_buckets = []
+
+    for bucket_name in required_buckets:
+        if not client.bucket_exists(bucket_name):
+            client.make_bucket(bucket_name)
+            created_buckets.append(bucket_name)
+            logger.info(f"✓ Created bucket: {bucket_name}")
+        else:
+            existing_buckets.append(bucket_name)
+            logger.info(f"✓ Bucket exists: {bucket_name}")
+
+    # Push results to XCom
+    context['task_instance'].xcom_push(key='created_buckets', value=created_buckets)
+    context['task_instance'].xcom_push(key='existing_buckets', value=existing_buckets)
+
+    logger.info(f"✓ All {len(required_buckets)} buckets ready")
+
+    return {
+        'created': created_buckets,
+        'existing': existing_buckets
+    }
+
+
 # ==================== COMPILE KUBEFLOW PIPELINE ====================
 def compile_and_upload_pipeline(**context):
     """Compile Kubeflow pipeline from Python to YAML and upload to MinIO"""
@@ -361,6 +407,290 @@ def compile_and_upload_pipeline(**context):
         raise
 
 
+# ==================== DATA QUALITY SUMMARY ====================
+def generate_data_quality_summary(**context):
+    """Generate comprehensive data quality summary report"""
+    from minio import Minio
+
+    logger.info("Generating data quality summary")
+
+    # Get validation report path
+    validation_report_path = context['task_instance'].xcom_pull(
+        task_ids='validate_data',
+        key='validation_report_path'
+    )
+
+    # Initialize MinIO client
+    client = Minio(
+        config['storage']['minio_endpoint'],
+        access_key=config['storage']['minio_access_key'],
+        secret_key=config['storage']['minio_secret_key'],
+        secure=False
+    )
+
+    # Load validation report
+    response = client.get_object(
+        config['storage']['bucket_name'],
+        validation_report_path
+    )
+    report = json.loads(response.read())
+
+    # Generate summary
+    summary = {
+        'pipeline_run': datetime.now().isoformat(),
+        'data_quality': {
+            'is_valid': report['is_valid'],
+            'total_records': report['stats']['total_records'],
+            'unique_regions': report['stats']['unique_regions'],
+            'error_count': len(report['errors']),
+            'warning_count': len(report['warnings']),
+        },
+        'data_statistics': report['stats']['value_stats'],
+        'date_range': report['stats']['date_range'],
+        'regions': report['stats'].get('regions', [])
+    }
+
+    # Log summary
+    logger.info("=" * 60)
+    logger.info("DATA QUALITY SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"Status: {'✅ VALID' if summary['data_quality']['is_valid'] else '❌ INVALID'}")
+    logger.info(f"Records: {summary['data_quality']['total_records']:,}")
+    logger.info(f"Regions: {summary['data_quality']['unique_regions']}")
+    logger.info(f"Errors: {summary['data_quality']['error_count']}")
+    logger.info(f"Warnings: {summary['data_quality']['warning_count']}")
+    logger.info(f"Date Range: {summary['date_range']['start']} to {summary['date_range']['end']}")
+    logger.info("=" * 60)
+
+    # Push summary to XCom
+    context['task_instance'].xcom_push(key='data_quality_summary', value=summary)
+
+    return summary
+
+
+# ==================== GENERATE PIPELINE PARAMETERS ====================
+def generate_pipeline_parameters(**context):
+    """Generate ready-to-use parameters for Kubeflow pipeline"""
+
+    logger.info("Generating Kubeflow pipeline parameters")
+
+    # Get validated data path
+    validated_data_path = context['task_instance'].xcom_pull(
+        task_ids='validate_data',
+        key='validated_data_path'
+    )
+
+    # Get pipeline YAML path
+    pipeline_yaml_path = context['task_instance'].xcom_pull(
+        task_ids='compile_and_upload_pipeline',
+        key='pipeline_yaml_minio_path'
+    )
+
+    # Generate parameters
+    parameters = {
+        "input_object_name": validated_data_path,
+        "minio_endpoint": config['storage']['minio_endpoint'],
+        "minio_access_key": config['storage']['minio_access_key'],
+        "minio_secret_key": config['storage']['minio_secret_key'],
+        "bucket_name": config['storage']['bucket_name'],
+        "mlflow_tracking_uri": config['mlflow']['tracking_uri'],
+        "experiment_name": config['mlflow']['experiment_name'],
+        "model_type": "lstm",
+        "hidden_size": config['model']['hidden_size'],
+        "num_layers": config['model']['num_layers'],
+        "dropout": config['model']['dropout'],
+        "learning_rate": config['model']['learning_rate'],
+        "batch_size": config['model']['batch_size'],
+        "epochs": config['model']['epochs'],
+        "sequence_length": config['model']['sequence_length'],
+        "prediction_horizon": config['model']['prediction_horizon']
+    }
+
+    # Save parameters to MinIO
+    timestamp = context['task_instance'].xcom_pull(
+        task_ids='extract_data',
+        key='timestamp'
+    )
+
+    from minio import Minio
+    client = Minio(
+        config['storage']['minio_endpoint'],
+        access_key=config['storage']['minio_access_key'],
+        secret_key=config['storage']['minio_secret_key'],
+        secure=False
+    )
+
+    params_path = f"pipeline_parameters/parameters_{timestamp}.json"
+    params_bytes = json.dumps(parameters, indent=2).encode('utf-8')
+    params_buffer = BytesIO(params_bytes)
+
+    client.put_object(
+        config['storage']['bucket_name'],
+        params_path,
+        params_buffer,
+        length=len(params_bytes),
+        content_type='application/json'
+    )
+
+    logger.info("=" * 60)
+    logger.info("KUBEFLOW PIPELINE PARAMETERS")
+    logger.info("=" * 60)
+    logger.info(f"Pipeline YAML: {pipeline_yaml_path}")
+    logger.info(f"Parameters file: {params_path}")
+    logger.info("")
+    logger.info("Copy these parameters when creating Kubeflow run:")
+    logger.info("-" * 60)
+    for key, value in parameters.items():
+        logger.info(f"  {key}: {value}")
+    logger.info("=" * 60)
+
+    # Push to XCom
+    context['task_instance'].xcom_push(key='pipeline_parameters', value=parameters)
+    context['task_instance'].xcom_push(key='pipeline_parameters_path', value=params_path)
+
+    return params_path
+
+
+# ==================== CLEANUP OLD FILES ====================
+def cleanup_old_files(**context):
+    """Clean up old files from MinIO (keep last 10 of each type)"""
+    from minio import Minio
+
+    logger.info("Cleaning up old files from MinIO")
+
+    client = Minio(
+        config['storage']['minio_endpoint'],
+        access_key=config['storage']['minio_access_key'],
+        secret_key=config['storage']['minio_secret_key'],
+        secure=False
+    )
+
+    prefixes_to_clean = [
+        'raw/',
+        'processed/',
+        'validation_reports/',
+        'pipelines/',
+        'pipeline_parameters/'
+    ]
+
+    keep_count = 10
+    total_deleted = 0
+
+    for prefix in prefixes_to_clean:
+        # List all objects with this prefix
+        objects = list(client.list_objects(
+            config['storage']['bucket_name'],
+            prefix=prefix
+        ))
+
+        if len(objects) <= keep_count:
+            logger.info(f"  {prefix}: {len(objects)} files (keeping all)")
+            continue
+
+        # Sort by last modified (oldest first)
+        objects_sorted = sorted(objects, key=lambda x: x.last_modified)
+
+        # Delete oldest files
+        to_delete = objects_sorted[:-keep_count]
+
+        for obj in to_delete:
+            try:
+                client.remove_object(
+                    config['storage']['bucket_name'],
+                    obj.object_name
+                )
+                total_deleted += 1
+            except Exception as e:
+                logger.warning(f"  Failed to delete {obj.object_name}: {e}")
+
+        logger.info(f"  {prefix}: Deleted {len(to_delete)} old files (kept {keep_count} newest)")
+
+    logger.info(f"✓ Cleanup complete: {total_deleted} files deleted")
+
+    return total_deleted
+
+
+# ==================== SEND SUCCESS NOTIFICATION ====================
+def send_success_notification(**context):
+    """Log success notification with pipeline details"""
+
+    # Get all relevant info from XCom
+    timestamp = context['task_instance'].xcom_pull(
+        task_ids='extract_data',
+        key='timestamp'
+    )
+
+    num_records = context['task_instance'].xcom_pull(
+        task_ids='validate_data',
+        key='num_validated_records'
+    )
+
+    validated_data_path = context['task_instance'].xcom_pull(
+        task_ids='validate_data',
+        key='validated_data_path'
+    )
+
+    pipeline_yaml_path = context['task_instance'].xcom_pull(
+        task_ids='compile_and_upload_pipeline',
+        key='pipeline_yaml_minio_path'
+    )
+
+    pipeline_params_path = context['task_instance'].xcom_pull(
+        task_ids='generate_pipeline_parameters',
+        key='pipeline_parameters_path'
+    )
+
+    data_quality = context['task_instance'].xcom_pull(
+        task_ids='data_quality_summary',
+        key='data_quality_summary'
+    )
+
+    # Log comprehensive success message
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("🎉 PIPELINE PREPARATION COMPLETED SUCCESSFULLY!")
+    logger.info("=" * 80)
+    logger.info("")
+    logger.info("📊 DATA SUMMARY:")
+    logger.info(f"  • Timestamp: {timestamp}")
+    logger.info(f"  • Records validated: {num_records:,}")
+    logger.info(f"  • Regions: {data_quality['data_quality']['unique_regions']}")
+    logger.info(f"  • Date range: {data_quality['date_range']['start']} to {data_quality['date_range']['end']}")
+    logger.info("")
+    logger.info("📁 MINIO ARTIFACTS:")
+    logger.info(f"  • Validated data: {validated_data_path}")
+    logger.info(f"  • Pipeline YAML: {pipeline_yaml_path}")
+    logger.info(f"  • Pipeline parameters: {pipeline_params_path}")
+    logger.info("")
+    logger.info("🚀 NEXT STEPS:")
+    logger.info("  1. Access MinIO UI: kubectl port-forward -n minio svc/minio 9001:9001")
+    logger.info("  2. Download pipeline YAML from: " + pipeline_yaml_path)
+    logger.info("  3. Access Kubeflow UI: kubectl port-forward -n kubeflow svc/ml-pipeline-ui 8080:80")
+    logger.info("  4. Upload pipeline and create run")
+    logger.info("  5. Use parameters from: " + pipeline_params_path)
+    logger.info("")
+    logger.info("💡 QUICK START:")
+    logger.info("  MinIO: http://localhost:9001 (minioadmin/minioadmin)")
+    logger.info("  Kubeflow: http://localhost:8080")
+    logger.info("  MLflow: kubectl port-forward -n mlflow svc/mlflow 5000:5000")
+    logger.info("")
+    logger.info("=" * 80)
+
+    # Create notification summary
+    notification = {
+        'status': 'SUCCESS',
+        'timestamp': timestamp,
+        'records': num_records,
+        'artifacts': {
+            'data': validated_data_path,
+            'pipeline': pipeline_yaml_path,
+            'parameters': pipeline_params_path
+        }
+    }
+
+    return notification
+
+
 # ===================================================================
 # DAG DEFINITION
 # ===================================================================
@@ -369,7 +699,7 @@ def compile_and_upload_pipeline(**context):
 with DAG(
     'electricity_pipeline_preparation',
     default_args=default_args,
-    description='Weekly pipeline: Extract → Validate → Compile Pipeline → Store in MinIO',
+    description='Weekly pipeline: Extract → Validate → Compile → Generate Parameters → Cleanup',
     schedule='0 0 * * 0',  # Every Sunday at midnight
     start_date=datetime(2025, 1, 1),
     catchup=False,
@@ -388,14 +718,38 @@ with DAG(
         python_callable=validate_data,
     )
 
-    # Task 3: Compile Kubeflow Pipeline YAML → save to MinIO pipelines/
+    # Task 3: Generate data quality summary
+    quality_summary_task = PythonOperator(
+        task_id='data_quality_summary',
+        python_callable=generate_data_quality_summary,
+    )
+
+    # Task 4: Compile Kubeflow Pipeline YAML → save to MinIO pipelines/
     compile_and_upload_task = PythonOperator(
         task_id='compile_and_upload_pipeline',
         python_callable=compile_and_upload_pipeline,
     )
 
+    # Task 5: Generate pipeline parameters → save to MinIO
+    generate_params_task = PythonOperator(
+        task_id='generate_pipeline_parameters',
+        python_callable=generate_pipeline_parameters,
+    )
+
+    # Task 6: Cleanup old files from MinIO
+    cleanup_task = PythonOperator(
+        task_id='cleanup_old_files',
+        python_callable=cleanup_old_files,
+    )
+
+    # Task 7: Send success notification
+    notification_task = PythonOperator(
+        task_id='send_success_notification',
+        python_callable=send_success_notification,
+    )
+
     # Define task dependencies
-    extract_task >> validate_task >> compile_and_upload_task
+    extract_task >> validate_task >> quality_summary_task >> compile_and_upload_task >> generate_params_task >> cleanup_task >> notification_task
 
 
 # ===================================================================
