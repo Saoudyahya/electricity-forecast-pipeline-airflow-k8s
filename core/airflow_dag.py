@@ -376,7 +376,8 @@ def trigger_kubeflow_pipeline(**context):
         experiment_name = "electricity-forecasting"
         experiment_payload = {
             "display_name": experiment_name,
-            "description": "Electricity load forecasting experiments"
+            "description": "Electricity load forecasting experiments",
+            "namespace": kf_namespace  # IMPORTANT - needed for multi-user mode!
         }
 
         exp_payload_file = '/tmp/kfp_exp_payload.json'
