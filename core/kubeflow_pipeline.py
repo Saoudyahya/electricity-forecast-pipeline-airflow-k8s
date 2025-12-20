@@ -62,11 +62,11 @@ def train_lstm_model(
     from collections import namedtuple
 
     print("=" * 80)
-    print(f"🚀 Training {model_type.upper()} Model")
+    print(f"Training {model_type.upper()} Model")
     print("=" * 80)
-    print(f"📁 Data source: MinIO/{bucket_name}/{input_object_name}")
-    print(f"📊 MLflow: {mlflow_tracking_uri}")
-    print(f"🎯 Experiment: {experiment_name}")
+    print(f"Data source: MinIO/{bucket_name}/{input_object_name}")
+    print(f"MLflow: {mlflow_tracking_uri}")
+    print(f"Experiment: {experiment_name}")
     print("=" * 80)
 
     # Configure MLflow to use MinIO for artifacts
@@ -88,7 +88,7 @@ def train_lstm_model(
     )
 
     # Download pre-validated data from MinIO
-    print(f"\n📥 Loading validated data from MinIO...")
+    print(f"\nLoading validated data from MinIO...")
     response = client.get_object(bucket_name, input_object_name)
     df = pd.read_csv(BytesIO(response.read()))
     df['period'] = pd.to_datetime(df['period'])
@@ -99,9 +99,9 @@ def train_lstm_model(
     df = df[df['respondent'] == selected_region].copy()
     df = df.sort_values('period').reset_index(drop=True)
 
-    print(f"✓ Loaded {len(df)} records")
-    print(f"✓ Training region: {selected_region}")
-    print(f"✓ Date range: {df['period'].min()} to {df['period'].max()}")
+    print(f"Loaded {len(df)} records")
+    print(f"Training region: {selected_region}")
+    print(f"Date range: {df['period'].min()} to {df['period'].max()}")
 
     # Prepare data
     values = df['value'].values.reshape(-1, 1)
@@ -139,7 +139,7 @@ def train_lstm_model(
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
 
-    print(f"\n📊 Data splits:")
+    print(f"\nData splits:")
     print(f"  Train: {len(train_dataset)} samples")
     print(f"  Val:   {len(val_dataset)} samples")
     print(f"  Test:  {len(test_dataset)} samples")
@@ -202,7 +202,7 @@ def train_lstm_model(
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
 
-    print(f"\n🧠 Model: {model_type.upper()}")
+    print(f"\nModel: {model_type.upper()}")
     print(f"  Device: {device}")
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -211,7 +211,7 @@ def train_lstm_model(
 
     # Start MLflow run
     with mlflow.start_run() as run:
-        print(f"\n📈 MLflow Run ID: {run.info.run_id}")
+        print(f"\nMLflow Run ID: {run.info.run_id}")
 
         # Log parameters
         mlflow.log_param("model_type", model_type)
@@ -230,7 +230,7 @@ def train_lstm_model(
         mlflow.log_param("test_size", len(test_dataset))
 
         # Training loop
-        print(f"\n🏋️ Training for {epochs} epochs...")
+        print(f"\nTraining for {epochs} epochs...")
         print("-" * 80)
 
         best_val_loss = float('inf')
@@ -281,14 +281,14 @@ def train_lstm_model(
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    print(f"✓ Early stopping at epoch {epoch+1}")
+                    print(f"Early stopping at epoch {epoch+1}")
                     break
 
         # Load best model
         model.load_state_dict(torch.load('/tmp/best_model.pt'))
 
         # Test evaluation
-        print(f"\n🧪 Evaluating on test set...")
+        print(f"\nEvaluating on test set...")
         model.eval()
         test_predictions = []
         test_actuals = []
@@ -317,16 +317,16 @@ def train_lstm_model(
         mlflow.log_metric("best_val_loss", best_val_loss)
 
         print("=" * 80)
-        print("✅ Training Complete!")
+        print("Training Complete!")
         print("=" * 80)
-        print(f"📊 Test Metrics:")
+        print(f"Test Metrics:")
         print(f"  RMSE: {test_rmse:.4f} MW")
         print(f"  MAPE: {test_mape:.2f}%")
         print(f"  Best Val Loss: {best_val_loss:.6f}")
         print("=" * 80)
 
         # Save model with scaler to MLflow (artifacts stored in MinIO)
-        print(f"\n💾 Saving model to MLflow...")
+        print(f"\nSaving model to MLflow...")
         mlflow.pytorch.log_model(model, "model")
 
         # Also save scaler
@@ -335,7 +335,7 @@ def train_lstm_model(
             pickle.dump(scaler, f)
         mlflow.log_artifact('/tmp/scaler.pkl')
 
-        print(f"✓ Model artifacts saved to MinIO via MLflow")
+        print(f"Model artifacts saved to MinIO via MLflow")
 
         # Register model in MLflow Model Registry
         model_uri = f"runs:/{run.info.run_id}/model"
@@ -344,7 +344,7 @@ def train_lstm_model(
         try:
             model_version = mlflow.register_model(model_uri, model_name)
             version_number = model_version.version
-            print(f"✓ Model registered: {model_name} v{version_number}")
+            print(f"Model registered: {model_name} v{version_number}")
 
             # Add description
             from mlflow.tracking import MlflowClient
@@ -356,7 +356,7 @@ def train_lstm_model(
             )
 
         except Exception as e:
-            print(f"⚠️ Model registration warning: {e}")
+            print(f"Model registration warning: {e}")
             version_number = "unknown"
 
         # Save model info for next component
@@ -429,22 +429,22 @@ if __name__ == '__main__':
     )
 
     print("=" * 80)
-    print("✅ Kubeflow Pipeline Compiled Successfully!")
+    print("Kubeflow Pipeline Compiled Successfully!")
     print("=" * 80)
-    print("📄 Output: electricity_forecasting_pipeline.yaml")
-    print("\n🔧 Pipeline Architecture:")
+    print("Output: electricity_forecasting_pipeline.yaml")
+    print("\nPipeline Architecture:")
     print("  Input:  Pre-validated data from MinIO (provided by Airflow)")
     print("  Task:   Train LSTM/Transformer model")
     print("  Output: Model logged to MLflow + artifacts in MinIO")
-    print("\n📊 Integration Flow:")
-    print("  1. Airflow extracts data from EIA → MinIO raw/")
-    print("  2. Airflow validates data → MinIO processed/")
+    print("\nIntegration Flow:")
+    print("  1. Airflow extracts data from EIA -> MinIO raw/")
+    print("  2. Airflow validates data -> MinIO processed/")
     print("  3. Airflow triggers THIS Kubeflow pipeline")
-    print("  4. Kubeflow trains model → MLflow + MinIO")
+    print("  4. Kubeflow trains model -> MLflow + MinIO")
     print("  5. Model ready for inference!")
-    print("\n💾 Storage:")
-    print("  • Training data:  MinIO (processed/)")
-    print("  • Model artifacts: MinIO (via MLflow)")
-    print("  • Experiments:     MLflow tracking server")
-    print("  • Model registry:  MLflow Model Registry")
+    print("\nStorage:")
+    print("  - Training data:  MinIO (processed/)")
+    print("  - Model artifacts: MinIO (via MLflow)")
+    print("  - Experiments:     MLflow tracking server")
+    print("  - Model registry:  MLflow Model Registry")
     print("=" * 80)
