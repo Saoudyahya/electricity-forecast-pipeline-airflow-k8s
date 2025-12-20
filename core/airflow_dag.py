@@ -322,6 +322,7 @@ def compile_kubeflow_pipeline(**context):
 def trigger_kubeflow_pipeline(**context):
     """Trigger Kubeflow Pipeline for model training with validated data from MinIO"""
     import kfp
+    import requests
 
     logger.info("Triggering Kubeflow Pipeline for model training")
 
@@ -346,44 +347,50 @@ def trigger_kubeflow_pipeline(**context):
     # Kubeflow namespace
     kf_namespace = 'kubeflow'
 
-    # Connect to Kubeflow with kubeflow-userid header
+    # Monkey-patch requests to inject header
     logger.info("Connecting to Kubeflow with kubeflow-userid header")
 
-    kfp_client = kfp.Client(
-        host=config['kubeflow']['pipeline_host'],
-        namespace=kf_namespace
-    )
+    original_request = requests.Session.request
 
-    # Inject the required header
-    kfp_client._api_client.default_headers['kubeflow-userid'] = 'airflow@kubeflow.org'
+    def patched_request(self, method, url, **kwargs):
+        if 'headers' not in kwargs:
+            kwargs['headers'] = {}
+        kwargs['headers']['kubeflow-userid'] = 'airflow@kubeflow.org'
+        return original_request(self, method, url, **kwargs)
 
-    logger.info("✓ Connected to Kubeflow")
+    requests.Session.request = patched_request
 
-    # Pipeline parameters
-    pipeline_params = {
-        'input_object_name': validated_data_path,
-        'minio_endpoint': config['storage']['minio_endpoint'],
-        'minio_access_key': config['storage']['minio_access_key'],
-        'minio_secret_key': config['storage']['minio_secret_key'],
-        'bucket_name': config['storage']['bucket_name'],
-        'mlflow_tracking_uri': config['mlflow']['tracking_uri'],
-        'experiment_name': config['mlflow']['experiment_name'],
-        'model_type': 'lstm',
-        'hidden_size': config['model']['hidden_size'],
-        'num_layers': config['model']['num_layers'],
-        'dropout': config['model']['dropout'],
-        'learning_rate': config['model']['learning_rate'],
-        'batch_size': config['model']['batch_size'],
-        'epochs': config['model']['epochs'],
-        'sequence_length': config['model']['sequence_length'],
-        'prediction_horizon': config['model']['prediction_horizon']
-    }
-
-    # Create run name
-    run_name = f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-
-    # Submit pipeline
     try:
+        kfp_client = kfp.Client(
+            host=config['kubeflow']['pipeline_host'],
+            namespace=kf_namespace
+        )
+
+        logger.info("✓ Connected to Kubeflow")
+
+        # Pipeline parameters
+        pipeline_params = {
+            'input_object_name': validated_data_path,
+            'minio_endpoint': config['storage']['minio_endpoint'],
+            'minio_access_key': config['storage']['minio_access_key'],
+            'minio_secret_key': config['storage']['minio_secret_key'],
+            'bucket_name': config['storage']['bucket_name'],
+            'mlflow_tracking_uri': config['mlflow']['tracking_uri'],
+            'experiment_name': config['mlflow']['experiment_name'],
+            'model_type': 'lstm',
+            'hidden_size': config['model']['hidden_size'],
+            'num_layers': config['model']['num_layers'],
+            'dropout': config['model']['dropout'],
+            'learning_rate': config['model']['learning_rate'],
+            'batch_size': config['model']['batch_size'],
+            'epochs': config['model']['epochs'],
+            'sequence_length': config['model']['sequence_length'],
+            'prediction_horizon': config['model']['prediction_horizon']
+        }
+
+        # Create run name
+        run_name = f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
         logger.info(f"Submitting pipeline run: {run_name}")
 
         if not os.path.exists(pipeline_yaml_path):
@@ -419,6 +426,10 @@ def trigger_kubeflow_pipeline(**context):
         logger.error("=" * 80)
         logger.error(f"Error: {str(e)}")
         raise
+
+    finally:
+        # Restore original request method
+        requests.Session.request = original_request
 
 
 # ==================== KATIB HPO ====================
