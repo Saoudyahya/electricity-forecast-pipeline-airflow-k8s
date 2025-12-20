@@ -322,7 +322,6 @@ def compile_kubeflow_pipeline(**context):
 def trigger_kubeflow_pipeline(**context):
     """Trigger Kubeflow Pipeline for model training with validated data from MinIO"""
     import kfp
-    from kfp_server_api import ApiClient, Configuration
 
     logger.info("Triggering Kubeflow Pipeline for model training")
 
@@ -344,23 +343,82 @@ def trigger_kubeflow_pipeline(**context):
     logger.info(f"Training on {num_records} validated records")
     logger.info(f"Using pipeline: {pipeline_yaml_path}")
 
+    # Kubeflow namespace
     kf_namespace = 'kubeflow'
 
-    # Connect to Kubeflow WITH the required header
+    # Connect to Kubeflow with kubeflow-userid header
     logger.info("Connecting to Kubeflow with kubeflow-userid header")
 
-    kfp_config = Configuration()
-    kfp_config.host = config['kubeflow']['pipeline_host']
-
-    api_client = ApiClient(configuration=kfp_config)
-    api_client.default_headers['kubeflow-userid'] = 'airflow@kubeflow.org'  # Add header!
-
     kfp_client = kfp.Client(
-        existing_api_client=api_client,
+        host=config['kubeflow']['pipeline_host'],
         namespace=kf_namespace
     )
 
+    # Inject the required header
+    kfp_client._api_client.default_headers['kubeflow-userid'] = 'airflow@kubeflow.org'
+
     logger.info("✓ Connected to Kubeflow")
+
+    # Pipeline parameters
+    pipeline_params = {
+        'input_object_name': validated_data_path,
+        'minio_endpoint': config['storage']['minio_endpoint'],
+        'minio_access_key': config['storage']['minio_access_key'],
+        'minio_secret_key': config['storage']['minio_secret_key'],
+        'bucket_name': config['storage']['bucket_name'],
+        'mlflow_tracking_uri': config['mlflow']['tracking_uri'],
+        'experiment_name': config['mlflow']['experiment_name'],
+        'model_type': 'lstm',
+        'hidden_size': config['model']['hidden_size'],
+        'num_layers': config['model']['num_layers'],
+        'dropout': config['model']['dropout'],
+        'learning_rate': config['model']['learning_rate'],
+        'batch_size': config['model']['batch_size'],
+        'epochs': config['model']['epochs'],
+        'sequence_length': config['model']['sequence_length'],
+        'prediction_horizon': config['model']['prediction_horizon']
+    }
+
+    # Create run name
+    run_name = f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+    # Submit pipeline
+    try:
+        logger.info(f"Submitting pipeline run: {run_name}")
+
+        if not os.path.exists(pipeline_yaml_path):
+            raise FileNotFoundError(f"Pipeline YAML not found at {pipeline_yaml_path}")
+
+        # Submit the run
+        run = kfp_client.create_run_from_pipeline_package(
+            pipeline_file=pipeline_yaml_path,
+            arguments=pipeline_params,
+            run_name=run_name,
+            namespace=kf_namespace
+        )
+
+        logger.info("=" * 80)
+        logger.info("✅ Kubeflow pipeline submitted successfully!")
+        logger.info("=" * 80)
+        logger.info(f"  Run ID: {run.run_id}")
+        logger.info(f"  Run Name: {run_name}")
+        logger.info(f"  Data Source: {validated_data_path}")
+        logger.info(f"  Records: {num_records:,}")
+        logger.info("=" * 80)
+
+        # Push run info to XCom
+        context['task_instance'].xcom_push(key='pipeline_run_id', value=run.run_id)
+        context['task_instance'].xcom_push(key='pipeline_run_name', value=run_name)
+        context['task_instance'].xcom_push(key='kf_namespace', value=kf_namespace)
+
+        return run.run_id
+
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error("❌ Failed to submit Kubeflow pipeline")
+        logger.error("=" * 80)
+        logger.error(f"Error: {str(e)}")
+        raise
 
 
 # ==================== KATIB HPO ====================
