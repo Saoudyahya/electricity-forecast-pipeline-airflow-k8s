@@ -369,7 +369,9 @@ def trigger_kubeflow_pipeline(**context):
 
     try:
         # Step 1: Create or get experiment
+        logger.info("=" * 80)
         logger.info("Creating/getting experiment...")
+        logger.info("=" * 80)
 
         experiment_name = "electricity-forecasting"
         experiment_payload = {
@@ -384,22 +386,44 @@ def trigger_kubeflow_pipeline(**context):
         # Try to create experiment
         exp_url = f"{api_host}/apis/v2beta1/experiments"
 
+        logger.info(f"Creating experiment at: {exp_url}")
+        logger.info(f"Experiment payload: {experiment_payload}")
+
         exp_result = subprocess.run([
             'curl', '-X', 'POST', exp_url,
             '-H', 'Content-Type: application/json',
             '-H', 'kubeflow-userid: airflow@kubeflow.org',
             '-d', f'@{exp_payload_file}',
+            '-w', '\nHTTP_CODE:%{http_code}',
             '-s'
         ], capture_output=True, text=True, timeout=30)
 
+        logger.info(f"Experiment creation response: {exp_result.stdout}")
+        if exp_result.stderr:
+            logger.info(f"Experiment creation stderr: {exp_result.stderr}")
+
         # Parse experiment response
+        experiment_id = None
         try:
-            exp_response = json.loads(exp_result.stdout)
+            # Split by HTTP_CODE if present
+            if 'HTTP_CODE:' in exp_result.stdout:
+                parts = exp_result.stdout.split('HTTP_CODE:')
+                exp_body = parts[0]
+                exp_code = parts[1].strip()
+                logger.info(f"Experiment HTTP Code: {exp_code}")
+            else:
+                exp_body = exp_result.stdout
+
+            exp_response = json.loads(exp_body)
             experiment_id = exp_response.get('experiment_id')
-            logger.info(f"✓ Experiment ID: {experiment_id}")
-        except:
+            logger.info(f"✓ Created Experiment ID: {experiment_id}")
+
+        except Exception as e:
+            logger.warning(f"Failed to create experiment: {e}")
+            logger.warning(f"Response was: {exp_result.stdout}")
+
             # If creation fails, try to list and find it
-            logger.info("Experiment may already exist, listing experiments...")
+            logger.info("Listing existing experiments...")
 
             list_result = subprocess.run([
                 'curl', '-X', 'GET',
@@ -408,28 +432,40 @@ def trigger_kubeflow_pipeline(**context):
                 '-s'
             ], capture_output=True, text=True, timeout=30)
 
+            logger.info(f"List experiments response: {list_result.stdout}")
+
             try:
                 list_response = json.loads(list_result.stdout)
                 experiments = list_response.get('experiments', [])
 
+                logger.info(f"Found {len(experiments)} experiments")
+
                 # Find our experiment
-                experiment_id = None
                 for exp in experiments:
+                    logger.info(f"  - {exp.get('display_name')}: {exp.get('experiment_id')}")
                     if exp.get('display_name') == experiment_name:
                         experiment_id = exp.get('experiment_id')
+                        logger.info(f"✓ Found matching experiment: {experiment_id}")
                         break
 
                 if not experiment_id and experiments:
                     # Use first experiment as fallback
                     experiment_id = experiments[0].get('experiment_id')
-                    logger.info(f"Using existing experiment: {experiment_id}")
+                    logger.info(f"Using first available experiment: {experiment_id}")
 
                 if not experiment_id:
                     raise Exception("No experiment found or could be created")
 
-            except Exception as e:
-                logger.error(f"Failed to get experiment: {e}")
-                raise
+            except Exception as e2:
+                logger.error(f"Failed to list experiments: {e2}")
+                logger.error(f"Response was: {list_result.stdout}")
+                raise Exception(f"Could not create or find experiment: {e}, {e2}")
+
+        if not experiment_id:
+            raise Exception("Experiment ID is None - cannot proceed")
+
+        logger.info(f"✓ Using Experiment ID: {experiment_id}")
+        logger.info("=" * 80)
 
         # Step 2: Submit pipeline run with experiment_id
         run_name = f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -462,6 +498,7 @@ def trigger_kubeflow_pipeline(**context):
             json.dump(payload, f, indent=2)
 
         logger.info(f"Payload saved to {payload_file}")
+        logger.info(f"Experiment ID in payload: {payload['experiment_id']}")
 
         # Make curl request
         api_url = f"{api_host}/apis/v2beta1/runs"
@@ -547,6 +584,8 @@ def trigger_kubeflow_pipeline(**context):
         logger.error("❌ Failed to submit Kubeflow pipeline")
         logger.error("=" * 80)
         logger.error(f"Error: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
 
