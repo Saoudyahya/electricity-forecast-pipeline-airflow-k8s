@@ -320,14 +320,12 @@ def compile_kubeflow_pipeline(**context):
 
 # ==================== KUBEFLOW PIPELINE ====================
 def trigger_kubeflow_pipeline(**context):
-    """Trigger Kubeflow Pipeline with authentication headers"""
+    """Trigger Kubeflow Pipeline for model training with validated data from MinIO"""
     import kfp
-    from kfp_server_api import ApiClient
-    from kfp_server_api.configuration import Configuration
 
     logger.info("Triggering Kubeflow Pipeline for model training")
 
-    # Get validated data path from previous task
+    # Get data paths from previous tasks
     validated_data_path = context['task_instance'].xcom_pull(
         task_ids='validate_data',
         key='validated_data_path'
@@ -336,8 +334,6 @@ def trigger_kubeflow_pipeline(**context):
         task_ids='validate_data',
         key='num_validated_records'
     )
-
-    # Get pipeline YAML path from compilation task
     pipeline_yaml_path = context['task_instance'].xcom_pull(
         task_ids='compile_pipeline',
         key='pipeline_yaml_path'
@@ -350,41 +346,13 @@ def trigger_kubeflow_pipeline(**context):
     # Kubeflow namespace
     kf_namespace = 'kubeflow-user-example-com'
 
-    # Connect to Kubeflow with authentication headers
-    try:
-        logger.info("Connecting to Kubeflow with authentication headers")
-
-        # Create custom configuration with auth headers
-        kfp_config = Configuration()
-        kfp_config.host = config['kubeflow']['pipeline_host']
-        kfp_config.verify_ssl = False
-
-        # Create API client with custom headers
-        api_client = ApiClient(configuration=kfp_config)
-
-        # Add authentication headers
-        # Option A: Use a service account email
-        api_client.default_headers['kubeflow-userid'] = 'airflow@example.com'
-
-        # Option B: Or use a generic user
-        # api_client.default_headers['kubeflow-userid'] = 'anonymous@kubeflow.org'
-
-        # Create KFP client with custom API client
-        kfp_client = kfp.Client(
-            host=config['kubeflow']['pipeline_host'],
-            namespace=kf_namespace,
-            existing_token=None,  # No token needed with header
-            client_id=None
-        )
-
-        # Inject the custom headers into the client
-        kfp_client._api_client = api_client
-
-        logger.info("✓ Connected to Kubeflow with authentication")
-
-    except Exception as e:
-        logger.error(f"Failed to connect to Kubeflow: {e}")
-        raise
+    # Connect to Kubeflow (no auth)
+    logger.info("Connecting to Kubeflow without authentication")
+    kfp_client = kfp.Client(
+        host=config['kubeflow']['pipeline_host'],
+        namespace=kf_namespace
+    )
+    logger.info("✓ Connected to Kubeflow")
 
     # Pipeline parameters
     pipeline_params = {
@@ -406,7 +374,7 @@ def trigger_kubeflow_pipeline(**context):
         'prediction_horizon': config['model']['prediction_horizon']
     }
 
-    # Create run name with timestamp
+    # Create run name
     run_name = f"training-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     # Submit pipeline
@@ -416,31 +384,11 @@ def trigger_kubeflow_pipeline(**context):
         if not os.path.exists(pipeline_yaml_path):
             raise FileNotFoundError(f"Pipeline YAML not found at {pipeline_yaml_path}")
 
-        # Create or get experiment (with error handling)
-        experiment = None
-        try:
-            experiment = kfp_client.get_experiment(
-                experiment_name=config['mlflow']['experiment_name']
-            )
-            logger.info(f"✓ Using existing experiment: {experiment.experiment_id}")
-        except Exception as exp_error:
-            logger.info(f"Creating new experiment: {config['mlflow']['experiment_name']}")
-            try:
-                experiment = kfp_client.create_experiment(
-                    name=config['mlflow']['experiment_name'],
-                    namespace=kf_namespace
-                )
-                logger.info(f"✓ Created experiment: {experiment.experiment_id}")
-            except Exception as create_error:
-                logger.warning(f"Could not create experiment: {create_error}")
-                logger.info("Proceeding without explicit experiment...")
-
-        # Submit the run
+        # Submit the run (skip experiment creation, just use default)
         run = kfp_client.create_run_from_pipeline_package(
             pipeline_file=pipeline_yaml_path,
             arguments=pipeline_params,
             run_name=run_name,
-            experiment_name=config['mlflow']['experiment_name'] if experiment else None,
             namespace=kf_namespace
         )
 
@@ -465,7 +413,6 @@ def trigger_kubeflow_pipeline(**context):
         logger.error("❌ Failed to submit Kubeflow pipeline")
         logger.error("=" * 80)
         logger.error(f"Error: {str(e)}")
-        logger.error(f"Error type: {type(e).__name__}")
         raise
 
 
