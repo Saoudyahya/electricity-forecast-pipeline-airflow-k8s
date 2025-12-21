@@ -14,7 +14,9 @@ storage:
   raw_data_prefix: "raw/"
   processed_data_prefix: "processed/"
   predictions_prefix: "predictions/"
-  pipeline_prefix: "pipelines/"  # NEW: Store compiled Kubeflow pipeline YAMLs
+  # Kubeflow pipeline storage - use dedicated bucket
+  pipeline_bucket: "kubeflow-pipelines"
+  pipeline_prefix: "compiled/"  # Store compiled pipeline YAMLs in dedicated bucket
 
 mlflow:
   tracking_uri: "http://mlflow.mlflow.svc.cluster.local:5000"
