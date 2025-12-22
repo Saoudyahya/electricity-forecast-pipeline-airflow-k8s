@@ -244,7 +244,7 @@ def ensure_minio_buckets(**context):
     required_buckets = [
         config['storage']['bucket_name'],
         'mlflow-artifacts',
-        'kubeflow-pipelines'
+        config['storage']['pipeline_bucket']  # Use pipeline_bucket from config
     ]
 
     created_buckets = []
@@ -353,17 +353,25 @@ def compile_and_upload_pipeline(**context):
             secure=False
         )
 
-        # Upload to MinIO
+        # Get the pipeline bucket name
+        pipeline_bucket = config['storage']['pipeline_bucket']
+
+        # Ensure pipeline bucket exists
+        if not client.bucket_exists(pipeline_bucket):
+            logger.info(f"Creating pipeline bucket: {pipeline_bucket}")
+            client.make_bucket(pipeline_bucket)
+
+        # Upload to MinIO (pipeline bucket, not data bucket)
         with open(output_yaml, 'rb') as f:
             client.put_object(
-                config['storage']['bucket_name'],
+                pipeline_bucket,  # Use dedicated pipeline bucket
                 minio_object_name,
                 f,
                 length=file_size,
                 content_type='application/x-yaml'
             )
 
-        logger.info(f"✓ Pipeline YAML uploaded to MinIO: s3://{config['storage']['bucket_name']}/{minio_object_name}")
+        logger.info(f"✓ Pipeline YAML uploaded to MinIO: s3://{pipeline_bucket}/{minio_object_name}")
 
         logger.info("=" * 80)
         logger.info("✅ Pipeline compilation and upload successful!")
@@ -379,6 +387,7 @@ def compile_and_upload_pipeline(**context):
         # Push to XCom
         context['task_instance'].xcom_push(key='pipeline_yaml_minio_path', value=minio_object_name)
         context['task_instance'].xcom_push(key='pipeline_yaml_local_path', value=output_yaml)
+        context['task_instance'].xcom_push(key='pipeline_bucket', value=pipeline_bucket)
 
         # Get validated data path for reference
         validated_data_path = context['task_instance'].xcom_pull(
@@ -486,6 +495,12 @@ def generate_pipeline_parameters(**context):
         key='pipeline_yaml_minio_path'
     )
 
+    # Get pipeline bucket
+    pipeline_bucket = context['task_instance'].xcom_pull(
+        task_ids='compile_and_upload_pipeline',
+        key='pipeline_bucket'
+    )
+
     # Generate parameters
     parameters = {
         "input_object_name": validated_data_path,
@@ -535,7 +550,7 @@ def generate_pipeline_parameters(**context):
     logger.info("=" * 60)
     logger.info("KUBEFLOW PIPELINE PARAMETERS")
     logger.info("=" * 60)
-    logger.info(f"Pipeline YAML: {pipeline_yaml_path}")
+    logger.info(f"Pipeline YAML location: s3://{pipeline_bucket}/{pipeline_yaml_path}")
     logger.info(f"Parameters file: {params_path}")
     logger.info("")
     logger.info("Copy these parameters when creating Kubeflow run:")
@@ -565,26 +580,32 @@ def cleanup_old_files(**context):
         secure=False
     )
 
+    # Format: (bucket_name, prefix)
     prefixes_to_clean = [
-        'raw/',
-        'processed/',
-        'validation_reports/',
-        'pipelines/',
-        'pipeline_parameters/'
+        (config['storage']['bucket_name'], 'raw/'),
+        (config['storage']['bucket_name'], 'processed/'),
+        (config['storage']['bucket_name'], 'validation_reports/'),
+        (config['storage']['pipeline_bucket'], 'compiled/'),  # Correct bucket for pipelines
+        (config['storage']['bucket_name'], 'pipeline_parameters/')
     ]
 
     keep_count = 10
     total_deleted = 0
 
-    for prefix in prefixes_to_clean:
+    for bucket_name, prefix in prefixes_to_clean:
+        # Check if bucket exists
+        if not client.bucket_exists(bucket_name):
+            logger.warning(f"  {bucket_name}: Bucket does not exist, skipping")
+            continue
+
         # List all objects with this prefix
         objects = list(client.list_objects(
-            config['storage']['bucket_name'],
+            bucket_name,
             prefix=prefix
         ))
 
         if len(objects) <= keep_count:
-            logger.info(f"  {prefix}: {len(objects)} files (keeping all)")
+            logger.info(f"  {bucket_name}/{prefix}: {len(objects)} files (keeping all)")
             continue
 
         # Sort by last modified (oldest first)
@@ -596,14 +617,14 @@ def cleanup_old_files(**context):
         for obj in to_delete:
             try:
                 client.remove_object(
-                    config['storage']['bucket_name'],
+                    bucket_name,
                     obj.object_name
                 )
                 total_deleted += 1
             except Exception as e:
                 logger.warning(f"  Failed to delete {obj.object_name}: {e}")
 
-        logger.info(f"  {prefix}: Deleted {len(to_delete)} old files (kept {keep_count} newest)")
+        logger.info(f"  {bucket_name}/{prefix}: Deleted {len(to_delete)} old files (kept {keep_count} newest)")
 
     logger.info(f"✓ Cleanup complete: {total_deleted} files deleted")
 
@@ -635,6 +656,11 @@ def send_success_notification(**context):
         key='pipeline_yaml_minio_path'
     )
 
+    pipeline_bucket = context['task_instance'].xcom_pull(
+        task_ids='compile_and_upload_pipeline',
+        key='pipeline_bucket'
+    )
+
     pipeline_params_path = context['task_instance'].xcom_pull(
         task_ids='generate_pipeline_parameters',
         key='pipeline_parameters_path'
@@ -658,16 +684,16 @@ def send_success_notification(**context):
     logger.info(f"  • Date range: {data_quality['date_range']['start']} to {data_quality['date_range']['end']}")
     logger.info("")
     logger.info("📁 MINIO ARTIFACTS:")
-    logger.info(f"  • Validated data: {validated_data_path}")
-    logger.info(f"  • Pipeline YAML: {pipeline_yaml_path}")
-    logger.info(f"  • Pipeline parameters: {pipeline_params_path}")
+    logger.info(f"  • Validated data: s3://{config['storage']['bucket_name']}/{validated_data_path}")
+    logger.info(f"  • Pipeline YAML: s3://{pipeline_bucket}/{pipeline_yaml_path}")
+    logger.info(f"  • Pipeline parameters: s3://{config['storage']['bucket_name']}/{pipeline_params_path}")
     logger.info("")
     logger.info("🚀 NEXT STEPS:")
     logger.info("  1. Access MinIO UI: kubectl port-forward -n minio svc/minio 9001:9001")
-    logger.info("  2. Download pipeline YAML from: " + pipeline_yaml_path)
+    logger.info(f"  2. Navigate to '{pipeline_bucket}' bucket and download: {pipeline_yaml_path}")
     logger.info("  3. Access Kubeflow UI: kubectl port-forward -n kubeflow svc/ml-pipeline-ui 8080:80")
     logger.info("  4. Upload pipeline and create run")
-    logger.info("  5. Use parameters from: " + pipeline_params_path)
+    logger.info(f"  5. Use parameters from: {pipeline_params_path}")
     logger.info("")
     logger.info("💡 QUICK START:")
     logger.info("  MinIO: http://localhost:9001 (minioadmin/minioadmin)")
@@ -682,9 +708,9 @@ def send_success_notification(**context):
         'timestamp': timestamp,
         'records': num_records,
         'artifacts': {
-            'data': validated_data_path,
-            'pipeline': pipeline_yaml_path,
-            'parameters': pipeline_params_path
+            'data': f"s3://{config['storage']['bucket_name']}/{validated_data_path}",
+            'pipeline': f"s3://{pipeline_bucket}/{pipeline_yaml_path}",
+            'parameters': f"s3://{config['storage']['bucket_name']}/{pipeline_params_path}"
         }
     }
 
