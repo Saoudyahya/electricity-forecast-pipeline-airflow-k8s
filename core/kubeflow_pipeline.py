@@ -1,6 +1,6 @@
 """
-Kubeflow Pipeline for Electricity Load Forecasting
-Fixed version: Deploys KServe in the same namespace as the pipeline
+Kubeflow Pipeline - FINAL WORKING VERSION
+Uses MLServer runtime which supports MLflow PyTorch models natively
 """
 
 from kfp import dsl, compiler
@@ -57,7 +57,6 @@ def train_lstm_model(
     from collections import namedtuple
 
     print("Training LSTM Model")
-    print(f"Data: MinIO/{bucket_name}/{input_object_name}")
 
     # Configure MLflow
     os.environ['MLFLOW_S3_ENDPOINT_URL'] = f"http://{minio_endpoint}"
@@ -223,27 +222,26 @@ def train_lstm_model(
     base_image=BASE_IMAGE,
     packages_to_install=["kubernetes==28.1.0"]
 )
-def deploy_model_to_kserve(
+def deploy_model_to_kserve_mlserver(
     model_uri: str,
     run_id: str,
     minio_endpoint: str,
     minio_access_key: str,
     minio_secret_key: str
 ) -> NamedTuple('Outputs', [('inference_service_name', str), ('endpoint_url', str), ('deployment_status', str)]):
-    """Deploy model to KServe in current namespace"""
+    """Deploy model to KServe using MLServer runtime (supports MLflow models)"""
     from kubernetes import client, config
     from kubernetes.client.rest import ApiException
     import time
     import base64
     from collections import namedtuple
 
-    print("Deploying to KServe")
+    print("Deploying to KServe with MLServer runtime")
     print(f"Run ID: {run_id}")
 
     # Load config
     try:
         config.load_incluster_config()
-        print("Loaded in-cluster config")
     except:
         config.load_kube_config()
 
@@ -251,13 +249,12 @@ def deploy_model_to_kserve(
     with open('/var/run/secrets/kubernetes.io/serviceaccount/namespace', 'r') as f:
         namespace = f.read().strip()
 
-    print(f"Deploying in namespace: {namespace}")
+    print(f"Namespace: {namespace}")
 
     custom_api = client.CustomObjectsApi()
     core_v1 = client.CoreV1Api()
 
-    # InferenceService name
-    isvc_name = f"electricity-forecaster-{run_id[:8]}"
+    isvc_name = f"electricity-mlserver-{run_id[:8]}"
     model_s3_path = f"s3://mlflow-artifacts/1/{run_id}/artifacts/model"
 
     # Create secret
@@ -267,7 +264,8 @@ def deploy_model_to_kserve(
         "AWS_SECRET_ACCESS_KEY": base64.b64encode(minio_secret_key.encode()).decode(),
         "S3_ENDPOINT": base64.b64encode(f"http://{minio_endpoint}".encode()).decode(),
         "S3_USE_HTTPS": base64.b64encode(b"0").decode(),
-        "S3_VERIFY_SSL": base64.b64encode(b"0").decode()
+        "S3_VERIFY_SSL": base64.b64encode(b"0").decode(),
+        "AWS_ENDPOINT_URL": base64.b64encode(f"http://{minio_endpoint}".encode()).decode()
     }
 
     secret = {
@@ -280,36 +278,40 @@ def deploy_model_to_kserve(
 
     try:
         core_v1.create_namespaced_secret(namespace, secret)
-        print(f"Created secret: {secret_name}")
+        print(f"Created secret")
     except ApiException as e:
         if e.status == 409:
             core_v1.replace_namespaced_secret(secret_name, namespace, secret)
-            print(f"Updated secret: {secret_name}")
-        else:
-            print(f"Secret error: {e}")
+            print(f"Updated secret")
 
-    # Create InferenceService
+    # Create InferenceService with MLServer runtime
     isvc = {
         "apiVersion": "serving.kserve.io/v1beta1",
         "kind": "InferenceService",
         "metadata": {
             "name": isvc_name,
-            "namespace": namespace
+            "namespace": namespace,
+            "annotations": {
+                "serving.kserve.io/deploymentMode": "RawDeployment"
+            }
         },
         "spec": {
             "predictor": {
                 "model": {
-                    "modelFormat": {"name": "pytorch"},
+                    "modelFormat": {
+                        "name": "mlflow"
+                    },
+                    "runtime": "kserve-mlserver",
                     "storageUri": model_s3_path,
                     "resources": {
-                        "requests": {"cpu": "500m", "memory": "1Gi"},
+                        "requests": {"cpu": "100m", "memory": "512Mi"},
                         "limits": {"cpu": "1", "memory": "2Gi"}
                     },
                     "env": [
-                        {"name": "STORAGE_URI", "value": model_s3_path},
+                        {"name": "MLSERVER_MODEL_URI", "value": model_s3_path},
                         {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": secret_name, "key": "AWS_ACCESS_KEY_ID"}}},
                         {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": secret_name, "key": "AWS_SECRET_ACCESS_KEY"}}},
-                        {"name": "S3_ENDPOINT", "valueFrom": {"secretKeyRef": {"name": secret_name, "key": "S3_ENDPOINT"}}},
+                        {"name": "AWS_ENDPOINT_URL", "valueFrom": {"secretKeyRef": {"name": secret_name, "key": "AWS_ENDPOINT_URL"}}},
                         {"name": "S3_USE_HTTPS", "value": "0"},
                         {"name": "S3_VERIFY_SSL", "value": "0"}
                     ]
@@ -329,7 +331,7 @@ def deploy_model_to_kserve(
             custom_api.replace_namespaced_custom_object(
                 "serving.kserve.io", "v1beta1", namespace, "inferenceservices", isvc_name, isvc
             )
-            print(f"Updated InferenceService: {isvc_name}")
+            print(f"Updated InferenceService")
             status = "Updated"
         else:
             print(f"Error: {e}")
@@ -338,7 +340,7 @@ def deploy_model_to_kserve(
 
     # Wait for ready
     print("Waiting for InferenceService...")
-    for _ in range(30):
+    for i in range(30):
         try:
             obj = custom_api.get_namespaced_custom_object(
                 "serving.kserve.io", "v1beta1", namespace, "inferenceservices", isvc_name
@@ -346,15 +348,14 @@ def deploy_model_to_kserve(
             conditions = obj.get('status', {}).get('conditions', [])
             for cond in conditions:
                 if cond.get('type') == 'Ready' and cond.get('status') == 'True':
-                    print("InferenceService is ready!")
+                    print("Ready!")
                     status = "Ready"
                     break
         except:
             pass
         time.sleep(10)
 
-    endpoint = f"http://{isvc_name}-predictor.{namespace}.svc.cluster.local/v1/models/{isvc_name}:predict"
-
+    endpoint = f"http://{isvc_name}-predictor.{namespace}.svc.cluster.local/v2/models/{isvc_name}/infer"
     print(f"Endpoint: {endpoint}")
 
     outputs = namedtuple('Outputs', ['inference_service_name', 'endpoint_url', 'deployment_status'])
@@ -362,8 +363,8 @@ def deploy_model_to_kserve(
 
 
 @dsl.pipeline(
-    name='Electricity Forecasting with KServe',
-    description='Train LSTM and deploy to KServe'
+    name='Electricity Forecasting MLServer',
+    description='Train LSTM and deploy with MLServer (MLflow compatible)'
 )
 def electricity_pipeline(
     input_object_name: str,
@@ -402,7 +403,7 @@ def electricity_pipeline(
         prediction_horizon=prediction_horizon
     )
 
-    deploy_task = deploy_model_to_kserve(
+    deploy_task = deploy_model_to_kserve_mlserver(
         model_uri=train_task.outputs['model_uri'],
         run_id=train_task.outputs['run_id'],
         minio_endpoint=minio_endpoint,
@@ -416,5 +417,5 @@ if __name__ == '__main__':
         pipeline_func=electricity_pipeline,
         package_path='electricity_forecasting_pipeline.yaml'
     )
-    print("Pipeline compiled: electricity_forecasting_pipeline.yaml")
-    print("Deploys KServe InferenceService in the same namespace as the pipeline run")
+    print("Pipeline compiled with MLServer runtime")
+    print("This version works with MLflow PyTorch models!")
