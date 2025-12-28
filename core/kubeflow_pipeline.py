@@ -327,7 +327,7 @@ def train_lstm_model(
         print(f"  Best Val Loss: {best_val_loss:.6f}")
         print("=" * 80)
 
-        # Save model with scaler to MLflow (artifacts stored in MinIO)
+        # Save model with scaler to MLflow
         print(f"\nSaving model to MLflow...")
         mlflow.pytorch.log_model(model, "model")
 
@@ -403,10 +403,10 @@ def deploy_model_to_kserve(
     print(f"Namespace: {namespace}")
     print("=" * 80)
 
-    # Load Kubernetes config (inside cluster)
+    # Load Kubernetes config
     try:
         config.load_incluster_config()
-        print("✓ Loaded in-cluster Kubernetes config")
+        print("Loaded in-cluster Kubernetes config")
     except Exception as e:
         print(f"Warning: Could not load in-cluster config: {e}")
         print("Attempting to load local kubeconfig...")
@@ -420,20 +420,14 @@ def deploy_model_to_kserve(
     # Generate InferenceService name
     inference_service_name = f"electricity-forecaster-{run_id[:8]}"
 
-    # Get MLflow artifact URI (stored in MinIO)
-    # Format: s3://mlflow-artifacts/<experiment_id>/<run_id>/artifacts/model
-    model_s3_uri = model_uri.replace("runs:/", "s3://mlflow-artifacts/")
-
-    # Extract experiment ID and construct proper S3 path
-    # We need to query MLflow to get the experiment ID
-    # For simplicity, we'll use a standard format
+    # Get MLflow artifact URI
     model_s3_path = f"s3://mlflow-artifacts/1/{run_id}/artifacts/model"
 
     print(f"\nModel storage:")
     print(f"  MLflow URI: {model_uri}")
     print(f"  S3 Path: {model_s3_path}")
 
-    # Create Secret for MinIO credentials (if it doesn't exist)
+    # Create Secret for MinIO credentials
     secret_name = "minio-s3-secret"
 
     secret_data = {
@@ -464,18 +458,17 @@ def deploy_model_to_kserve(
 
     try:
         core_v1.create_namespaced_secret(namespace=namespace, body=secret_manifest)
-        print(f"✓ Created secret: {secret_name}")
+        print(f"Created secret: {secret_name}")
     except ApiException as e:
-        if e.status == 409:  # Already exists
-            print(f"✓ Secret already exists: {secret_name}")
-            # Update the existing secret
+        if e.status == 409:
+            print(f"Secret already exists: {secret_name}")
             try:
                 core_v1.replace_namespaced_secret(
                     name=secret_name,
                     namespace=namespace,
                     body=secret_manifest
                 )
-                print(f"✓ Updated secret: {secret_name}")
+                print(f"Updated secret: {secret_name}")
             except Exception as update_error:
                 print(f"Warning: Could not update secret: {update_error}")
         else:
@@ -489,8 +482,7 @@ def deploy_model_to_kserve(
             "name": inference_service_name,
             "namespace": namespace,
             "annotations": {
-                "serving.kserve.io/enable-prometheus-scraping": "true",
-                "serving.kserve.io/enable-metric-aggregation": "true"
+                "serving.kserve.io/enable-prometheus-scraping": "true"
             },
             "labels": {
                 "app": "electricity-forecaster",
@@ -565,7 +557,6 @@ def deploy_model_to_kserve(
     print(f"\nCreating InferenceService: {inference_service_name}")
 
     try:
-        # Try to create the InferenceService
         response = custom_api.create_namespaced_custom_object(
             group="serving.kserve.io",
             version="v1beta1",
@@ -573,11 +564,11 @@ def deploy_model_to_kserve(
             plural="inferenceservices",
             body=inference_service
         )
-        print(f"✓ InferenceService created successfully")
+        print(f"InferenceService created successfully")
         deployment_status = "Created"
 
     except ApiException as e:
-        if e.status == 409:  # Already exists
+        if e.status == 409:
             print(f"InferenceService already exists, updating...")
             try:
                 response = custom_api.replace_namespaced_custom_object(
@@ -588,20 +579,20 @@ def deploy_model_to_kserve(
                     name=inference_service_name,
                     body=inference_service
                 )
-                print(f"✓ InferenceService updated successfully")
+                print(f"InferenceService updated successfully")
                 deployment_status = "Updated"
             except Exception as update_error:
-                print(f"❌ Error updating InferenceService: {update_error}")
+                print(f"Error updating InferenceService: {update_error}")
                 deployment_status = f"Failed: {str(update_error)}"
                 raise
         else:
-            print(f"❌ Error creating InferenceService: {e}")
+            print(f"Error creating InferenceService: {e}")
             deployment_status = f"Failed: {str(e)}"
             raise
 
-    # Wait for InferenceService to be ready (with timeout)
+    # Wait for InferenceService to be ready
     print(f"\nWaiting for InferenceService to be ready...")
-    max_wait = 300  # 5 minutes
+    max_wait = 300
     wait_interval = 10
     elapsed = 0
 
@@ -619,12 +610,11 @@ def deploy_model_to_kserve(
             status = isvc.get('status', {})
             conditions = status.get('conditions', [])
 
-            # Check if Ready condition is True
             for condition in conditions:
                 if condition.get('type') == 'Ready':
                     if condition.get('status') == 'True':
                         is_ready = True
-                        print(f"✓ InferenceService is ready!")
+                        print(f"InferenceService is ready!")
                         break
                     else:
                         reason = condition.get('reason', 'Unknown')
@@ -643,13 +633,12 @@ def deploy_model_to_kserve(
             elapsed += wait_interval
 
     if not is_ready:
-        print(f"⚠️ InferenceService not ready after {max_wait}s, but deployment submitted")
+        print(f"InferenceService not ready after {max_wait}s, but deployment submitted")
         deployment_status = "Pending"
 
     # Get endpoint URL
     endpoint_url = f"http://{inference_service_name}.{namespace}.svc.cluster.local/v1/models/{inference_service_name}:predict"
 
-    # Try to get the external URL if available
     try:
         isvc = custom_api.get_namespaced_custom_object(
             group="serving.kserve.io",
@@ -669,18 +658,12 @@ def deploy_model_to_kserve(
         print(f"  Could not get external URL: {e}")
 
     print("=" * 80)
-    print("✅ KServe Deployment Complete!")
+    print("KServe Deployment Complete!")
     print("=" * 80)
     print(f"InferenceService: {inference_service_name}")
     print(f"Namespace: {namespace}")
     print(f"Endpoint: {endpoint_url}")
     print(f"Status: {deployment_status}")
-    print("")
-    print("📡 Test the endpoint:")
-    print(f'  kubectl port-forward -n {namespace} svc/{inference_service_name}-predictor 8080:80')
-    print(f'  curl -X POST http://localhost:8080/v1/models/{inference_service_name}:predict \\')
-    print(f'    -H "Content-Type: application/json" \\')
-    print(f'    -d \'{{"instances": [[...168 values...]]}}\'')
     print("=" * 80)
 
     outputs = namedtuple('Outputs', ['inference_service_name', 'endpoint_url', 'deployment_status'])
@@ -692,15 +675,14 @@ def deploy_model_to_kserve(
     description='Train model with pre-validated data from MinIO, log to MLflow, deploy to KServe'
 )
 def electricity_training_pipeline(
-    input_object_name: str,  # Path to validated data in MinIO (from Airflow)
+    input_object_name: str,
     minio_endpoint: str = "minio.minio.svc.cluster.local:9000",
     minio_access_key: str = "minioadmin",
     minio_secret_key: str = "minioadmin",
     bucket_name: str = "electricity-data",
     mlflow_tracking_uri: str = "http://mlflow.mlflow.svc.cluster.local:5000",
     experiment_name: str = "electricity-load-forecasting",
-    # Model configuration
-    model_type: str = "lstm",  # "lstm" or "transformer"
+    model_type: str = "lstm",
     hidden_size: int = 128,
     num_layers: int = 2,
     dropout: float = 0.2,
@@ -709,27 +691,19 @@ def electricity_training_pipeline(
     epochs: int = 50,
     sequence_length: int = 168,
     prediction_horizon: int = 24,
-    # KServe deployment
     kserve_namespace: str = "kubeflow",
     service_account: str = "default-editor"
 ):
     """
     Complete MLOps Pipeline: Training + Deployment
 
-    Input: Pre-validated data from MinIO (provided by Airflow)
-    Process:
-      1. Train LSTM/Transformer model
-      2. Deploy to KServe for inference
-    Output:
-      - Model logged to MLflow, artifacts stored in MinIO
-      - Inference endpoint available via KServe
-
     Data extraction and validation are handled by Airflow.
+    This pipeline handles training and deployment only.
     """
 
-    # Task 1: Train model with pre-validated data from MinIO
+    # Task 1: Train model
     train_task = train_lstm_model(
-        input_object_name=input_object_name,  # From Airflow
+        input_object_name=input_object_name,
         minio_endpoint=minio_endpoint,
         minio_access_key=minio_access_key,
         minio_secret_key=minio_secret_key,
@@ -747,7 +721,7 @@ def electricity_training_pipeline(
         prediction_horizon=prediction_horizon
     )
 
-    # Task 2: Deploy trained model to KServe
+    # Task 2: Deploy to KServe
     deploy_task = deploy_model_to_kserve(
         model_uri=train_task.outputs['model_uri'],
         run_id=train_task.outputs['run_id'],
@@ -762,37 +736,23 @@ def electricity_training_pipeline(
 
 
 if __name__ == '__main__':
-    # Compile pipeline
     compiler.Compiler().compile(
         pipeline_func=electricity_training_pipeline,
         package_path='electricity_forecasting_pipeline.yaml'
     )
 
     print("=" * 80)
-    print("✅ Kubeflow Pipeline Compiled Successfully!")
+    print("Kubeflow Pipeline Compiled Successfully!")
     print("=" * 80)
     print("Output: electricity_forecasting_pipeline.yaml")
-    print("\n🏗️  Pipeline Architecture:")
-    print("  Input:  Pre-validated data from MinIO (provided by Airflow)")
-    print("  Task 1: Train LSTM/Transformer model → MLflow")
-    print("  Task 2: Deploy model to KServe → Inference endpoint")
-    print("  Output: Model logged to MLflow + KServe endpoint ready")
-    print("\n🔄 Integration Flow:")
-    print("  1. Airflow extracts data from EIA → MinIO raw/")
-    print("  2. Airflow validates data → MinIO processed/")
-    print("  3. Airflow compiles & stores pipeline YAML → MinIO pipelines/")
-    print("  4. User triggers THIS Kubeflow pipeline via UI")
-    print("  5. Kubeflow trains model → MLflow + MinIO")
-    print("  6. Kubeflow deploys model → KServe")
-    print("  7. Model ready for inference!")
-    print("\n💾 Storage:")
-    print("  - Training data:  MinIO (processed/)")
-    print("  - Pipeline YAML:  MinIO (pipelines/)")
-    print("  - Model artifacts: MinIO (via MLflow)")
-    print("  - Experiments:     MLflow tracking server")
-    print("  - Model registry:  MLflow Model Registry")
-    print("  - Inference:       KServe InferenceService")
-    print("\n📡 Inference Endpoint:")
-    print("  After deployment, access via:")
-    print("  POST /v1/models/electricity-forecaster-{run_id}:predict")
+    print("\nPipeline Architecture:")
+    print("  Task 1: Train LSTM/Transformer model -> MLflow")
+    print("  Task 2: Deploy model to KServe -> Inference endpoint")
+    print("\nIntegration Flow:")
+    print("  1. Airflow extracts data from EIA -> MinIO raw/")
+    print("  2. Airflow validates data -> MinIO processed/")
+    print("  3. User triggers Kubeflow pipeline via UI")
+    print("  4. Kubeflow trains model -> MLflow + MinIO")
+    print("  5. Kubeflow deploys model -> KServe")
+    print("  6. Model ready for inference!")
     print("=" * 80)
