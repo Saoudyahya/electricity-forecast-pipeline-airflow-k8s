@@ -1,7 +1,7 @@
 """
 Updated Kubeflow Pipeline for Electricity Load Forecasting
 Works with pre-validated data from Airflow stored in MinIO
-Focus: Training and MLflow logging only (no data extraction/validation)
+Focus: Training and MLflow logging + ONNX export to MinIO
 """
 
 from kfp import dsl, compiler
@@ -21,7 +21,9 @@ BASE_IMAGE = "python:3.10-slim"
         "scikit-learn==1.3.2",
         "mlflow==2.9.2",
         "minio==7.2.0",
-        "boto3==1.34.0"
+        "boto3==1.34.0",
+        "onnx==1.15.0",
+        "onnxruntime==1.16.3"
     ]
 )
 def train_lstm_model(
@@ -44,8 +46,8 @@ def train_lstm_model(
     prediction_horizon: int,
     # Output
     model_output_path: OutputPath(str)
-) -> NamedTuple('Outputs', [('model_uri', str), ('test_rmse', float), ('test_mape', float), ('model_version', str)]):
-    """Train LSTM/Transformer model with MLflow tracking and MinIO storage"""
+) -> NamedTuple('Outputs', [('model_uri', str), ('test_rmse', float), ('test_mape', float), ('model_version', str), ('onnx_model_path', str)]):
+    """Train LSTM/Transformer model with MLflow tracking and ONNX export to MinIO"""
     import pandas as pd
     import numpy as np
     import torch
@@ -62,7 +64,7 @@ def train_lstm_model(
     from collections import namedtuple
 
     print("=" * 80)
-    print(f"Training {model_type.upper()} Model")
+    print(f"Training {model_type.upper()} Model with ONNX Export")
     print("=" * 80)
     print(f"Data source: MinIO/{bucket_name}/{input_object_name}")
     print(f"MLflow: {mlflow_tracking_uri}")
@@ -325,17 +327,146 @@ def train_lstm_model(
         print(f"  Best Val Loss: {best_val_loss:.6f}")
         print("=" * 80)
 
-        # Save model with scaler to MLflow (artifacts stored in MinIO)
-        print(f"\nSaving model to MLflow...")
+        # Save PyTorch model to MLflow (artifacts stored in MinIO)
+        print(f"\nSaving PyTorch model to MLflow...")
         mlflow.pytorch.log_model(model, "model")
 
-        # Also save scaler
+        # Save scaler
         import pickle
         with open('/tmp/scaler.pkl', 'wb') as f:
             pickle.dump(scaler, f)
         mlflow.log_artifact('/tmp/scaler.pkl')
 
-        print(f"Model artifacts saved to MinIO via MLflow")
+        print(f"PyTorch model artifacts saved to MinIO via MLflow")
+
+        # ============================================================
+        # EXPORT TO ONNX AND SAVE TO MINIO
+        # ============================================================
+        print("\n" + "=" * 80)
+        print("Exporting Model to ONNX Format")
+        print("=" * 80)
+
+        # Move model to CPU for ONNX export
+        model = model.cpu()
+        model.eval()
+
+        # Create dummy input for ONNX export
+        dummy_input = torch.randn(1, sequence_length, 1)
+
+        # Export to ONNX
+        onnx_path = '/tmp/model.onnx'
+        print(f"Exporting to ONNX...")
+
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_path,
+            export_params=True,
+            opset_version=14,
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={
+                'input': {0: 'batch_size'},
+                'output': {0: 'batch_size'}
+            }
+        )
+
+        print(f"✓ ONNX model exported to {onnx_path}")
+
+        # Verify ONNX model
+        import onnx
+        import onnxruntime as ort
+
+        onnx_model = onnx.load(onnx_path)
+        onnx.checker.check_model(onnx_model)
+        print(f"✓ ONNX model verification passed")
+
+        # Test ONNX inference
+        ort_session = ort.InferenceSession(onnx_path)
+        ort_inputs = {ort_session.get_inputs()[0].name: dummy_input.numpy()}
+        ort_outputs = ort_session.run(None, ort_inputs)
+        print(f"✓ ONNX inference test passed")
+        print(f"   Input shape: {dummy_input.shape}")
+        print(f"   Output shape: {ort_outputs[0].shape}")
+
+        # Save ONNX model to MinIO
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        onnx_object_name = f"models/onnx/{model_type}_forecaster_{timestamp}.onnx"
+
+        print(f"\nUploading ONNX model to MinIO...")
+        with open(onnx_path, 'rb') as f:
+            file_stat = os.stat(onnx_path)
+            client.put_object(
+                bucket_name,
+                onnx_object_name,
+                f,
+                length=file_stat.st_size,
+                content_type='application/octet-stream'
+            )
+
+        print(f"✓ ONNX model uploaded to: s3://{bucket_name}/{onnx_object_name}")
+
+        # Save scaler to MinIO as well
+        scaler_object_name = f"models/onnx/{model_type}_scaler_{timestamp}.pkl"
+        with open('/tmp/scaler.pkl', 'rb') as f:
+            file_stat = os.stat('/tmp/scaler.pkl')
+            client.put_object(
+                bucket_name,
+                scaler_object_name,
+                f,
+                length=file_stat.st_size,
+                content_type='application/octet-stream'
+            )
+
+        print(f"✓ Scaler uploaded to: s3://{bucket_name}/{scaler_object_name}")
+
+        # Save model metadata
+        import json
+        metadata = {
+            "model_type": model_type,
+            "sequence_length": sequence_length,
+            "prediction_horizon": prediction_horizon,
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "test_rmse": float(test_rmse),
+            "test_mape": float(test_mape),
+            "training_region": selected_region,
+            "timestamp": timestamp,
+            "mlflow_run_id": run.info.run_id,
+            "onnx_model_path": onnx_object_name,
+            "scaler_path": scaler_object_name,
+            "input_shape": [1, sequence_length, 1],
+            "output_shape": [1, prediction_horizon]
+        }
+
+        metadata_object_name = f"models/onnx/{model_type}_metadata_{timestamp}.json"
+        metadata_bytes = json.dumps(metadata, indent=2).encode('utf-8')
+        metadata_buffer = BytesIO(metadata_bytes)
+
+        client.put_object(
+            bucket_name,
+            metadata_object_name,
+            metadata_buffer,
+            length=len(metadata_bytes),
+            content_type='application/json'
+        )
+
+        print(f"✓ Metadata uploaded to: s3://{bucket_name}/{metadata_object_name}")
+
+        # Log ONNX artifacts to MLflow as well
+        mlflow.log_artifact(onnx_path, "onnx")
+        mlflow.log_dict(metadata, "onnx/metadata.json")
+
+        print("=" * 80)
+        print("✅ ONNX Export Complete!")
+        print("=" * 80)
+        print(f"\nMinIO Artifacts:")
+        print(f"  • ONNX Model:  s3://{bucket_name}/{onnx_object_name}")
+        print(f"  • Scaler:      s3://{bucket_name}/{scaler_object_name}")
+        print(f"  • Metadata:    s3://{bucket_name}/{metadata_object_name}")
+        print("=" * 80)
 
         # Register model in MLflow Model Registry
         model_uri = f"runs:/{run.info.run_id}/model"
@@ -344,7 +475,7 @@ def train_lstm_model(
         try:
             model_version = mlflow.register_model(model_uri, model_name)
             version_number = model_version.version
-            print(f"Model registered: {model_name} v{version_number}")
+            print(f"\nModel registered: {model_name} v{version_number}")
 
             # Add description
             from mlflow.tracking import MlflowClient
@@ -352,7 +483,7 @@ def train_lstm_model(
             client_mlflow.update_model_version(
                 name=model_name,
                 version=version_number,
-                description=f"LSTM model trained on {selected_region} region. RMSE: {test_rmse:.2f}, MAPE: {test_mape:.2f}%"
+                description=f"{model_type.upper()} model trained on {selected_region} region. RMSE: {test_rmse:.2f}, MAPE: {test_mape:.2f}%. ONNX: {onnx_object_name}"
             )
 
         except Exception as e:
@@ -363,13 +494,13 @@ def train_lstm_model(
         with open(model_output_path, 'w') as f:
             f.write(model_uri)
 
-        outputs = namedtuple('Outputs', ['model_uri', 'test_rmse', 'test_mape', 'model_version'])
-        return outputs(model_uri, float(test_rmse), float(test_mape), str(version_number))
+        outputs = namedtuple('Outputs', ['model_uri', 'test_rmse', 'test_mape', 'model_version', 'onnx_model_path'])
+        return outputs(model_uri, float(test_rmse), float(test_mape), str(version_number), onnx_object_name)
 
 
 @dsl.pipeline(
-    name='Electricity Load Forecasting - Training Only',
-    description='Train model using pre-validated data from MinIO, log to MLflow'
+    name='Electricity Load Forecasting - Training with ONNX Export',
+    description='Train model using pre-validated data from MinIO, export to ONNX, log to MLflow'
 )
 def electricity_training_pipeline(
     input_object_name: str,  # Path to validated data in MinIO (from Airflow)
@@ -391,16 +522,19 @@ def electricity_training_pipeline(
     prediction_horizon: int = 24
 ):
     """
-    Simplified Kubeflow Pipeline - Training Only
+    Enhanced Kubeflow Pipeline - Training with ONNX Export
 
     Input: Pre-validated data from MinIO (provided by Airflow)
-    Process: Train LSTM/Transformer model
-    Output: Model logged to MLflow, artifacts stored in MinIO
+    Process: Train LSTM/Transformer model + Export to ONNX
+    Output:
+        - PyTorch model logged to MLflow (artifacts in MinIO)
+        - ONNX model saved directly to MinIO
+        - Model metadata (JSON) saved to MinIO
 
     Data extraction and validation are handled by Airflow.
     """
 
-    # Single task: Train model with pre-validated data from MinIO
+    # Single task: Train model and export to ONNX
     train_task = train_lstm_model(
         input_object_name=input_object_name,  # From Airflow
         minio_endpoint=minio_endpoint,
@@ -425,26 +559,37 @@ if __name__ == '__main__':
     # Compile pipeline
     compiler.Compiler().compile(
         pipeline_func=electricity_training_pipeline,
-        package_path='electricity_forecasting_pipeline.yaml'
+        package_path='electricity_forecasting_pipeline_onnx.yaml'
     )
 
     print("=" * 80)
-    print("Kubeflow Pipeline Compiled Successfully!")
+    print("✅ Kubeflow Pipeline Compiled Successfully!")
     print("=" * 80)
-    print("Output: electricity_forecasting_pipeline.yaml")
+    print("Output: electricity_forecasting_pipeline_onnx.yaml")
     print("\nPipeline Architecture:")
     print("  Input:  Pre-validated data from MinIO (provided by Airflow)")
-    print("  Task:   Train LSTM/Transformer model")
-    print("  Output: Model logged to MLflow + artifacts in MinIO")
+    print("  Task:   Train LSTM/Transformer model + Export to ONNX")
+    print("  Output: ")
+    print("    - PyTorch model → MLflow + MinIO")
+    print("    - ONNX model → MinIO (models/onnx/)")
+    print("    - Scaler → MinIO (models/onnx/)")
+    print("    - Metadata → MinIO (models/onnx/)")
     print("\nIntegration Flow:")
-    print("  1. Airflow extracts data from EIA -> MinIO raw/")
-    print("  2. Airflow validates data -> MinIO processed/")
+    print("  1. Airflow extracts data from EIA → MinIO raw/")
+    print("  2. Airflow validates data → MinIO processed/")
     print("  3. Airflow triggers THIS Kubeflow pipeline")
-    print("  4. Kubeflow trains model -> MLflow + MinIO")
-    print("  5. Model ready for inference!")
+    print("  4. Kubeflow trains model → MLflow + MinIO")
+    print("  5. Kubeflow exports to ONNX → MinIO models/onnx/")
+    print("  6. Model ready for deployment & inference!")
     print("\nStorage:")
-    print("  - Training data:  MinIO (processed/)")
-    print("  - Model artifacts: MinIO (via MLflow)")
-    print("  - Experiments:     MLflow tracking server")
-    print("  - Model registry:  MLflow Model Registry")
+    print("  • Training data:    MinIO (processed/)")
+    print("  • PyTorch artifacts: MinIO (via MLflow)")
+    print("  • ONNX models:      MinIO (models/onnx/)")
+    print("  • Experiments:      MLflow tracking server")
+    print("  • Model registry:   MLflow Model Registry")
+    print("\nONNX Deployment Benefits:")
+    print("  ✓ Cross-platform compatibility")
+    print("  ✓ Optimized inference performance")
+    print("  ✓ Smaller model size")
+    print("  ✓ Support for various deployment targets")
     print("=" * 80)
