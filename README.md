@@ -45,9 +45,8 @@ This project implements a complete **MLOps pipeline** for electricity load forec
 ### Key Highlights
 
 - 🔄 **Automated Data Pipeline** - Weekly data extraction and validation with Airflow
-- 🧠 **Deep Learning Models** - LSTM and Transformer architectures for time series forecasting
+- 🧠 **Deep Learning Models** - LSTM  architectures for time series forecasting
 - 📊 **Experiment Tracking** - MLflow integration for model versioning and metrics
-- 🎯 **Hyperparameter Optimization** - Katib integration for automated HPO
 - ☁️ **Cloud-Native** - Kubernetes-based deployment with MinIO object storage
 - ✅ **Data Quality** - Pandera-based schema validation and drift detection
 - 🔍 **Model Monitoring** - Evidently AI for performance monitoring
@@ -941,3 +940,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 [![Infrastructure](https://img.shields.io/badge/Infrastructure-Config-326CE5?style=for-the-badge)](https://github.com/Saoudyahya/airflow-k8s-config)
 
 </div>
+
