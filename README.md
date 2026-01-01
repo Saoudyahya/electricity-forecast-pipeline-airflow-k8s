@@ -20,6 +20,7 @@
 ## 📋 Table of Contents
 
 - [Overview](#-overview)
+- [Related Repositories](#-related-repositories)
 - [Architecture](#-architecture)
 - [Technology Stack](#-technology-stack)
 - [Features](#-features)
@@ -50,6 +51,80 @@ This project implements a complete **MLOps pipeline** for electricity load forec
 - ☁️ **Cloud-Native** - Kubernetes-based deployment with MinIO object storage
 - ✅ **Data Quality** - Pandera-based schema validation and drift detection
 - 🔍 **Model Monitoring** - Evidently AI for performance monitoring
+
+---
+
+## 🔗 Related Repositories
+
+This project is part of a complete MLOps ecosystem for electricity load forecasting. Check out these companion repositories:
+
+<div align="center">
+
+| Repository | Description | Technologies | Link |
+|------------|-------------|--------------|------|
+| **🌐 API & Web Interface** | FastAPI backend + Streamlit dashboard for real-time model inference, predictions visualization, and interactive forecasting | ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white) ![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=flat-square&logo=streamlit&logoColor=white) | [![GitHub](https://img.shields.io/badge/GitHub-Repository-181717?style=flat-square&logo=github)](https://github.com/Saoudyahya/electricity-forecasting-api-streamlit) |
+| **⚙️ Airflow K8s Config** | Production-ready Kubernetes manifests, Helm charts, and deployment configurations for Apache Airflow orchestration | ![Kubernetes](https://img.shields.io/badge/K8s-326CE5?style=flat-square&logo=kubernetes&logoColor=white) ![Helm](https://img.shields.io/badge/Helm-0F1689?style=flat-square&logo=helm&logoColor=white) | [![GitHub](https://img.shields.io/badge/GitHub-Repository-181717?style=flat-square&logo=github)](https://github.com/Saoudyahya/airflow-k8s-config) |
+
+</div>
+
+### 🎯 How They Work Together
+
+```mermaid
+graph TB
+    subgraph "This Repo: MLOps Training Pipeline"
+        DAG[Airflow DAG]
+        EXTRACT[Data Extraction]
+        VALIDATE[Data Validation]
+        TRAIN[Model Training]
+        MODEL[Trained Models]
+        MLFLOW[MLflow Registry]
+    end
+    
+    subgraph "airflow-k8s-config Repo"
+        K8S[K8s Manifests]
+        HELM[Helm Charts]
+        CONFIG[Airflow Config]
+    end
+    
+    subgraph "electricity-forecasting-api-streamlit Repo"
+        API[FastAPI Service]
+        LOAD[Model Loader]
+        PRED[Prediction Engine]
+        UI[Streamlit Dashboard]
+        VIZ[Visualizations]
+    end
+    
+    K8S -->|Deploy| DAG
+    HELM -->|Configure| DAG
+    CONFIG -->|Setup| DAG
+    
+    DAG --> EXTRACT
+    EXTRACT --> VALIDATE
+    VALIDATE --> TRAIN
+    TRAIN --> MODEL
+    MODEL --> MLFLOW
+    
+    MLFLOW -->|Download Models| LOAD
+    LOAD --> API
+    API --> PRED
+    PRED --> UI
+    UI --> VIZ
+    
+    style DAG fill:#017CEE
+    style MODEL fill:#EE4C2C
+    style K8S fill:#326CE5
+    style API fill:#009688
+    style UI fill:#FF4B4B
+    style MLFLOW fill:#0194E2
+```
+
+### 📦 Repository Purposes
+
+| Component | Purpose | When to Use |
+|-----------|---------|-------------|
+| **This Repository** | Train and validate ML models, orchestrate data pipelines, experiment tracking | Development, model training, hyperparameter tuning |
+| **API/Streamlit** | Serve predictions, provide user interface, real-time forecasting | Production inference, end-user access, dashboards |
+| **Airflow K8s Config** | Deploy and configure Airflow on Kubernetes | Infrastructure setup, production deployment |
 
 ---
 
@@ -91,6 +166,11 @@ graph TB
         TRANS[Transformer Model]
     end
     
+    subgraph "Serving Layer"
+        FASTAPI[FastAPI Service]
+        STREAMLIT[Streamlit UI]
+    end
+    
     EIA -->|Extract| AF
     AF -->|Raw Data| MINIO
     MINIO -->|Validate| VAL
@@ -104,6 +184,8 @@ graph TB
     KATIB -->|Optimize| KF
     MINIO -->|Monitor| EV
     EV --> DRIFT
+    MLF -->|Serve| FASTAPI
+    FASTAPI --> STREAMLIT
     
     style EIA fill:#4CAF50
     style AF fill:#017CEE
@@ -112,6 +194,8 @@ graph TB
     style MLF fill:#0194E2
     style LSTM fill:#EE4C2C
     style TRANS fill:#EE4C2C
+    style FASTAPI fill:#009688
+    style STREAMLIT fill:#FF4B4B
 ```
 
 ### Technology Stack
@@ -130,6 +214,8 @@ graph TB
 | **Monitoring** | ![Evidently](https://img.shields.io/badge/Evidently-FF6B6B?style=flat-square&logo=python&logoColor=white) | Model drift detection and performance monitoring |
 | **Container Orchestration** | ![Kubernetes](https://img.shields.io/badge/Kubernetes-326CE5?style=flat-square&logo=kubernetes&logoColor=white) | Container orchestration and deployment |
 | **Data Processing** | ![Pandas](https://img.shields.io/badge/Pandas-150458?style=flat-square&logo=pandas&logoColor=white) | Data manipulation and analysis |
+| **API Service** | ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white) | High-performance API for model serving |
+| **Dashboard** | ![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=flat-square&logo=streamlit&logoColor=white) | Interactive web interface for predictions |
 
 </div>
 
@@ -162,6 +248,7 @@ graph TB
 - **Comprehensive Testing** suite for all components
 - **Drift Detection** for model performance monitoring
 - **Modular Architecture** for easy extension and maintenance
+- **Production Inference** via FastAPI service (see [API repository](https://github.com/Saoudyahya/electricity-forecasting-api-streamlit))
 
 ---
 
@@ -174,7 +261,7 @@ graph TB
 - **EIA API Key** - [Register here](https://www.eia.gov/opendata/register.php)
 
 ### Kubernetes Services
-- Apache Airflow
+- Apache Airflow (see [Airflow K8s Config](https://github.com/Saoudyahya/airflow-k8s-config) for deployment)
 - Kubeflow Pipelines
 - MLflow
 - MinIO
@@ -236,7 +323,7 @@ kubeflow:
 
 ## 🎮 Usage
 
-### Pipeline Workflow
+### Complete Workflow
 
 ```mermaid
 sequenceDiagram
@@ -248,8 +335,10 @@ sequenceDiagram
     participant Kubeflow
     participant PyTorch
     participant MLflow
+    participant FastAPI
+    participant Streamlit
 
-    Note over User,MLflow: Weekly Automated Pipeline
+    Note over User,Streamlit: Full MLOps Lifecycle
 
     Airflow->>EIA: Extract electricity data
     EIA-->>Airflow: Return hourly load data
@@ -264,7 +353,7 @@ sequenceDiagram
     Airflow->>Airflow: Compile Kubeflow pipeline
     Airflow->>MinIO: Save pipeline YAML
     
-    Note over User,MLflow: Manual Trigger (or scheduled)
+    Note over User,Streamlit: Training Phase
     
     User->>Kubeflow: Trigger training pipeline
     Kubeflow->>MinIO: Load validated data
@@ -272,7 +361,15 @@ sequenceDiagram
     PyTorch->>PyTorch: Training loop
     PyTorch->>MLflow: Log metrics & model
     MLflow->>MinIO: Store artifacts
-    MLflow-->>User: Model ready for deployment
+    
+    Note over User,Streamlit: Inference Phase
+    
+    FastAPI->>MLflow: Download best model
+    User->>Streamlit: Request prediction
+    Streamlit->>FastAPI: API call
+    FastAPI->>FastAPI: Generate forecast
+    FastAPI-->>Streamlit: Return predictions
+    Streamlit-->>User: Display results
 ```
 
 ### Step-by-Step Guide
@@ -293,6 +390,12 @@ python tests/test_model_training.py
 #### 2. Deploy to Kubernetes
 
 ```bash
+# Deploy Airflow using the companion repository
+# See: https://github.com/Saoudyahya/airflow-k8s-config
+git clone https://github.com/Saoudyahya/airflow-k8s-config.git
+cd airflow-k8s-config
+# Follow deployment instructions
+
 # Deploy Airflow DAG
 kubectl cp core/airflow_dag.py airflow-pod:/opt/airflow/dags/
 
@@ -364,6 +467,17 @@ kubectl port-forward -n mlflow svc/mlflow 5000:5000
 # - Model registry
 ```
 
+#### 8. Deploy Inference API (Optional)
+
+```bash
+# Clone the API repository
+git clone https://github.com/Saoudyahya/electricity-forecasting-api-streamlit.git
+cd electricity-forecasting-api-streamlit
+
+# Follow deployment instructions in that repository
+# The API will automatically fetch models from MLflow
+```
+
 ---
 
 ## 📁 Project Structure
@@ -388,6 +502,21 @@ electricity-load-forecasting/
     ├── 📄 test_extraction.py    # Data extraction tests
     ├── 📄 test_validation.py    # Data validation tests
     └── 📄 test_model_training.py # Model training tests
+```
+
+### Related Repositories Structure
+
+```
+📦 Complete MLOps Ecosystem
+├── 📁 electricity-load-forecasting/          # This repository (Training Pipeline)
+├── 📁 electricity-forecasting-api-streamlit/ # Inference & UI
+│   ├── 📁 api/                               # FastAPI service
+│   ├── 📁 streamlit/                         # Web dashboard
+│   └── 📁 models/                            # Model serving logic
+└── 📁 airflow-k8s-config/                    # Infrastructure
+    ├── 📁 helm/                              # Helm charts
+    ├── 📁 manifests/                         # K8s manifests
+    └── 📁 configs/                           # Airflow configurations
 ```
 
 ---
@@ -499,6 +628,19 @@ kubectl apply -f k8s/mlflow-deployment.yaml
 
 #### 3. Deploy Airflow
 
+For production-ready Airflow deployment, use the companion repository:
+
+```bash
+# Clone the Airflow configuration repository
+git clone https://github.com/Saoudyahya/airflow-k8s-config.git
+cd airflow-k8s-config
+
+# Follow the deployment guide in that repository
+# It includes production-ready Helm values and K8s manifests
+```
+
+Or deploy with Helm directly:
+
 ```bash
 kubectl create namespace airflow
 helm install airflow apache-airflow/airflow -n airflow
@@ -511,6 +653,13 @@ export PIPELINE_VERSION=2.0.0
 kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/cluster-scoped-resources?ref=$PIPELINE_VERSION"
 kubectl wait --for condition=established --timeout=60s crd/applications.app.k8s.io
 kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/env/platform-agnostic?ref=$PIPELINE_VERSION"
+```
+
+#### 5. Deploy Inference API (Optional)
+
+```bash
+# See the API repository for deployment instructions
+# https://github.com/Saoudyahya/electricity-forecasting-api-streamlit
 ```
 
 ### Docker Images
@@ -554,6 +703,11 @@ graph LR
         ALERT[Alerts]
     end
     
+    subgraph "Production"
+        API_METRICS[API Latency]
+        PRED_ACCURACY[Prediction Accuracy]
+    end
+    
     TRAIN --> MLflow
     VAL --> MLflow
     RMSE --> MLflow
@@ -565,19 +719,25 @@ graph LR
     DRIFT --> ALERT
     PERF --> ALERT
     
+    API_METRICS --> Monitoring
+    PRED_ACCURACY --> Monitoring
+    
     style MLflow fill:#0194E2
     style ALERT fill:#FF6B6B
+    style Monitoring fill:#009688
 ```
 
 ### Key Metrics
 
-| Metric | Description | Target |
-|--------|-------------|--------|
-| **RMSE** | Root Mean Squared Error | < 2000 MW |
-| **MAPE** | Mean Absolute Percentage Error | < 5% |
-| **Training Time** | Time to train model | < 30 min |
-| **Data Freshness** | Age of training data | < 7 days |
-| **Model Drift** | Distribution shift detection | < 0.1 |
+| Metric | Description | Target | Monitored In |
+|--------|-------------|--------|--------------|
+| **RMSE** | Root Mean Squared Error | < 2000 MW | MLflow |
+| **MAPE** | Mean Absolute Percentage Error | < 5% | MLflow |
+| **Training Time** | Time to train model | < 30 min | Kubeflow |
+| **Data Freshness** | Age of training data | < 7 days | Airflow |
+| **Model Drift** | Distribution shift detection | < 0.1 | Evidently |
+| **API Latency** | Inference response time | < 100ms | FastAPI |
+| **Prediction Throughput** | Predictions per second | > 100 | FastAPI |
 
 ### Access Monitoring Dashboards
 
@@ -597,6 +757,11 @@ kubectl port-forward -n kubeflow svc/ml-pipeline-ui 8080:80
 # MinIO Console
 kubectl port-forward -n minio svc/minio 9001:9001
 # → http://localhost:9001
+
+# Streamlit Dashboard (if deployed)
+# See: https://github.com/Saoudyahya/electricity-forecasting-api-streamlit
+kubectl port-forward -n inference svc/streamlit 8501:8501
+# → http://localhost:8501
 ```
 
 ---
@@ -650,6 +815,32 @@ model:
   hidden_size: 64  # from 128
 ```
 
+#### Issue: Airflow DAG Not Appearing
+
+```bash
+# Check if DAG file is in correct location
+kubectl exec -n airflow airflow-scheduler-0 -- ls /opt/airflow/dags/
+
+# Check DAG for syntax errors
+kubectl exec -n airflow airflow-scheduler-0 -- python /opt/airflow/dags/airflow_dag.py
+
+# For more detailed Airflow troubleshooting, see:
+# https://github.com/Saoudyahya/airflow-k8s-config
+```
+
+#### Issue: API Service Not Connecting to MLflow
+
+```bash
+# Verify MLflow endpoint
+kubectl get svc -n mlflow
+
+# Test connection from API pod
+kubectl exec -n inference api-pod -- curl http://mlflow.mlflow.svc.cluster.local:5000/health
+
+# For API-specific issues, see:
+# https://github.com/Saoudyahya/electricity-forecasting-api-streamlit
+```
+
 ---
 
 ## 🤝 Contributing
@@ -670,6 +861,13 @@ Contributions are welcome! Please follow these guidelines:
 - Ensure all tests pass
 - Add type hints to functions
 
+### Multi-Repository Contributions
+
+If your contribution spans multiple repositories:
+1. Create PRs in all affected repositories
+2. Link the PRs together in the description
+3. Ensure compatibility across repositories
+
 ---
 
 ## 📄 License
@@ -685,14 +883,46 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **MLflow** team for experiment tracking framework
 - **Apache Airflow** for workflow orchestration
 - **PyTorch** team for deep learning framework
+- **FastAPI** and **Streamlit** teams for inference infrastructure
 
 ---
 
 ## 📞 Contact & Support
 
+### This Repository
 - **Issues**: [GitHub Issues](https://github.com/yourusername/electricity-load-forecasting/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/electricity-load-forecasting/discussions)
+
+### Related Repositories
+- **API/Streamlit Issues**: [Report here](https://github.com/Saoudyahya/electricity-forecasting-api-streamlit/issues)
+- **Airflow Config Issues**: [Report here](https://github.com/Saoudyahya/airflow-k8s-config/issues)
+
+### General
 - **Email**: your.email@example.com
+
+---
+
+## 🗺️ Roadmap
+
+### Current Features ✅
+- [x] EIA API data extraction
+- [x] Pandera data validation
+- [x] LSTM and Transformer models
+- [x] MLflow experiment tracking
+- [x] Kubeflow pipeline orchestration
+- [x] Airflow workflow automation
+- [x] FastAPI inference service
+- [x] Streamlit dashboard
+
+### Upcoming Features 🚀
+- [ ] Real-time streaming predictions
+- [ ] Multi-region forecasting
+- [ ] Advanced feature engineering
+- [ ] Ensemble model support
+- [ ] A/B testing framework
+- [ ] Automated model retraining
+- [ ] Performance benchmarking
+- [ ] GraphQL API support
 
 ---
 
@@ -703,5 +933,11 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ![Made with Python](https://img.shields.io/badge/Made%20with-Python-1f425f.svg)
 ![Made with PyTorch](https://img.shields.io/badge/Made%20with-PyTorch-EE4C2C.svg)
 ![MLOps](https://img.shields.io/badge/MLOps-Production%20Ready-success)
+
+### 🔗 Project Ecosystem
+
+[![Training Pipeline](https://img.shields.io/badge/Training-Pipeline-017CEE?style=for-the-badge)](https://github.com/yourusername/electricity-load-forecasting)
+[![API Service](https://img.shields.io/badge/API-Service-009688?style=for-the-badge)](https://github.com/Saoudyahya/electricity-forecasting-api-streamlit)
+[![Infrastructure](https://img.shields.io/badge/Infrastructure-Config-326CE5?style=for-the-badge)](https://github.com/Saoudyahya/airflow-k8s-config)
 
 </div>
